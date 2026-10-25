@@ -2054,7 +2054,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn native_import_temporary_retention_gc_and_external_ownership() -> TestResult {
-        use crate::api::blobs::AddPathOptions;
+        use crate::{api::blobs::{AddPathOptions, ImportMode}, BlobFormat};
         use crate::store::gc::gc_run_once;
         use tokio::time::{timeout, Duration};
         timeout(Duration::from_secs(60), async {
