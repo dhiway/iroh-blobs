@@ -1057,6 +1057,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn persistence_abort_closes_buffered_replies_and_deferred_admission() {
+            let (mut manager, mut tasks, mut entered, _gate) = fixture(false);
+            parked(&mut manager, &mut tasks, &mut entered).await;
+            let (queued, queued_rx) = oneshot::channel();
+            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            let (deferred, deferred_rx) = oneshot::channel();
+            // Abort after receiver handback while persistence is awaiting its gate.
+            tasks.abort_all();
+            timeout(Duration::from_secs(5), manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks)).await.unwrap();
+            assert!(queued_rx.await.is_err());
+            assert_eq!(deferred_rx.await.unwrap(), 3);
+            while let Some(result) = tasks.join_next().await {
+                assert!(result.unwrap_err().is_cancelled());
+            }
+            manager.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn cancellation_drops_only_deferred_work_and_manager_still_progresses() {
             let (mut manager, mut tasks, mut entered, gate) = fixture(false);
             parked(&mut manager, &mut tasks, &mut entered).await;

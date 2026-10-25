@@ -12,7 +12,7 @@ const IMPORTS: usize = 20_000;
 const CONCURRENCY: usize = 64;
 
 fn value(index: usize, distinct: usize, large: bool) -> Bytes {
-    if index % 101 == 0 {
+    if index.is_multiple_of(101) {
         return Bytes::new();
     }
     let mut data = if large {
