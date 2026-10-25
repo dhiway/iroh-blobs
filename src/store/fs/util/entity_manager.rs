@@ -1061,11 +1061,19 @@ mod tests {
             let (mut manager, mut tasks, mut entered, _gate) = fixture(false);
             parked(&mut manager, &mut tasks, &mut entered).await;
             let (queued, queued_rx) = oneshot::channel();
-            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            assert!(manager
+                .spawn(1, move |arg| answer(arg, queued))
+                .await
+                .is_none());
             let (deferred, deferred_rx) = oneshot::channel();
             // Abort after receiver handback while persistence is awaiting its gate.
             tasks.abort_all();
-            timeout(Duration::from_secs(5), manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks)).await.unwrap();
+            timeout(
+                Duration::from_secs(5),
+                manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks),
+            )
+            .await
+            .unwrap();
             assert!(queued_rx.await.is_err());
             assert_eq!(deferred_rx.await.unwrap(), 3);
             while let Some(result) = tasks.join_next().await {

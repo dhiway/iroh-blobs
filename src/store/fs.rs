@@ -2108,8 +2108,11 @@ pub mod tests {
     async fn native_import_external_close_releases_full_internal_ingress() -> TestResult {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let directory = tempfile::tempdir()?;
-            let (mut actor, commands, internal) = native_import_actor_fixture(directory.path()).await?;
-            internal.send(ClearScope { scope: Scope(123) }.into()).await?;
+            let (mut actor, commands, internal) =
+                native_import_actor_fixture(directory.path()).await?;
+            internal
+                .send(ClearScope { scope: Scope(123) }.into())
+                .await?;
             assert_eq!(internal.capacity(), 0);
             let (entered, ready) = tokio::sync::oneshot::channel();
             let (released, finished) = tokio::sync::oneshot::channel();
@@ -2117,7 +2120,11 @@ pub mod tests {
                 entered.send(()).unwrap();
                 // This worker uses the same bounded ingress as preprocessing.
                 // It can finish only when the actor closes that ingress.
-                while internal.send(ClearScope { scope: Scope(123) }.into()).await.is_ok() {}
+                while internal
+                    .send(ClearScope { scope: Scope(123) }.into())
+                    .await
+                    .is_ok()
+                {}
                 released.send(()).unwrap();
             });
             ready.await?;
@@ -2125,69 +2132,102 @@ pub mod tests {
             actor.run().await;
             finished.await?;
             Ok(())
-        }).await?
+        })
+        .await?
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_import_external_close_drives_last_entity_restart() -> TestResult {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let directory = tempfile::tempdir()?;
-            let (mut actor, commands, internal) = native_import_actor_fixture(directory.path()).await?;
+            let (mut actor, commands, internal) =
+                native_import_actor_fixture(directory.path()).await?;
             let hash = Hash::new(b"queued across retirement");
-            let first = actor.handles.spawn(hash, |arg| async move {
-                assert!(matches!(arg, SpawnArg::Active(_)));
-            }).await.unwrap();
+            let first = actor
+                .handles
+                .spawn(hash, |arg| async move {
+                    assert!(matches!(arg, SpawnArg::Active(_)));
+                })
+                .await
+                .unwrap();
             // Finish retirement while its handback remains buffered in the manager.
             first.await;
             assert!(actor.handles.has_pending_lifecycle());
             let (completed, reply) = tokio::sync::oneshot::channel();
-            assert!(actor.handles.spawn(hash, move |arg| async move {
-                assert!(matches!(arg, SpawnArg::Active(_)));
-                completed.send(()).unwrap();
-            }).await.is_none());
+            assert!(actor
+                .handles
+                .spawn(hash, move |arg| async move {
+                    assert!(matches!(arg, SpawnArg::Active(_)));
+                    completed.send(()).unwrap();
+                })
+                .await
+                .is_none());
             drop(commands);
             drop(internal);
             actor.run().await;
             reply.await?;
             Ok(())
-        }).await?
+        })
+        .await?
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_import_lost_reader_after_deferred_admission_still_finishes() -> TestResult {
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let directory = tempfile::tempdir()?;
-            let (mut actor, commands, internal) = native_import_actor_fixture(directory.path()).await?;
+            let (mut actor, commands, internal) =
+                native_import_actor_fixture(directory.path()).await?;
             let data = Bytes::from_static(b"finish after its reader disappears");
             let hash = Hash::new(&data);
             // Keep the first actor unpolled, so its single-slot inbox is full.
-            let first = actor.handles.spawn(hash, |arg| async move {
-                assert!(matches!(arg, SpawnArg::Active(_)));
-            }).await.unwrap();
+            let first = actor
+                .handles
+                .spawn(hash, |arg| async move {
+                    assert!(matches!(arg, SpawnArg::Active(_)));
+                })
+                .await
+                .unwrap();
             let (progress, reader) = mpsc::channel(1);
-            let mut admission = Box::pin(actor.handle_fs_command(native_import_entry(data.clone(), progress)));
-            assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut admission).await.is_err());
+            let mut admission =
+                Box::pin(actor.handle_fs_command(native_import_entry(data.clone(), progress)));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), &mut admission)
+                    .await
+                    .is_err()
+            );
             // FinishImport is now waiting at native entity admission, not preprocessing.
             drop(reader);
             let first = tokio::spawn(first);
             admission.await;
-            actor.tasks.spawn(async move { first.await.unwrap(); });
+            actor.tasks.spawn(async move {
+                first.await.unwrap();
+            });
             let store = FsStore::new(commands.into(), internal);
             let running = tokio::spawn(actor.run());
             // Admission is not completion; wait for actual native readback.
             loop {
-                if store.get_bytes(hash).await.is_ok_and(|bytes| bytes == data) { break; }
+                if store.get_bytes(hash).await.is_ok_and(|bytes| bytes == data) {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
             loop {
-                let tags = store.tags().list_temp_tags().await?.collect::<Vec<_>>().await;
-                if !tags.iter().any(|value| value.hash == hash) { break; }
+                let tags = store
+                    .tags()
+                    .list_temp_tags()
+                    .await?
+                    .collect::<Vec<_>>()
+                    .await;
+                if !tags.iter().any(|value| value.hash == hash) {
+                    break;
+                }
                 tokio::task::yield_now().await;
             }
             drop(store);
             running.await?;
             Ok(())
-        }).await?
+        })
+        .await?
     }
 
     #[tokio::test]
