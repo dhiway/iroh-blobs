@@ -594,13 +594,21 @@ impl Actor {
                         },
                     );
                     let hash = cmd.hash;
-                    self.handles.spawn_wait(hash, move |arg| async move {
-                        match arg {
-                            SpawnArg::Active(state) => (tt, cmd).handle(state).await,
-                            SpawnArg::Dead => (tt, cmd).on_error(arg).await,
-                            SpawnArg::Busy => unreachable!("waiting admission never returns Busy"),
-                        }
-                    }, &mut self.tasks).await;
+                    self.handles
+                        .spawn_wait(
+                            hash,
+                            move |arg| async move {
+                                match arg {
+                                    SpawnArg::Active(state) => (tt, cmd).handle(state).await,
+                                    SpawnArg::Dead => (tt, cmd).on_error(arg).await,
+                                    SpawnArg::Busy => {
+                                        unreachable!("waiting admission never returns Busy")
+                                    }
+                                }
+                            },
+                            &mut self.tasks,
+                        )
+                        .await;
                 }
             }
         }
@@ -609,7 +617,9 @@ impl Actor {
     async fn run(mut self) {
         let mut ingress_closed = false;
         loop {
-            if ingress_closed && self.tasks.is_empty() && self.fs_cmd_rx.is_empty()
+            if ingress_closed
+                && self.tasks.is_empty()
+                && self.fs_cmd_rx.is_empty()
                 && !self.handles.has_pending_lifecycle()
             {
                 break;
@@ -2054,8 +2064,11 @@ pub mod tests {
 
     #[tokio::test]
     async fn native_import_temporary_retention_gc_and_external_ownership() -> TestResult {
-        use crate::{api::blobs::{AddPathOptions, ImportMode}, BlobFormat};
         use crate::store::gc::gc_run_once;
+        use crate::{
+            api::blobs::{AddPathOptions, ImportMode},
+            BlobFormat,
+        };
         use tokio::time::{timeout, Duration};
         timeout(Duration::from_secs(60), async {
             let directory = tempfile::tempdir()?;
@@ -2063,10 +2076,14 @@ pub mod tests {
             let data = vec![0x42; 128 * 1024];
             std::fs::write(&external, &data)?;
             let store = FsStore::load(directory.path().join("db")).await?;
-            let tag = store.add_path_with_opts(AddPathOptions {
-                path: external.clone(), format: BlobFormat::Raw,
-                mode: ImportMode::TryReference,
-            }).temp_tag().await?;
+            let tag = store
+                .add_path_with_opts(AddPathOptions {
+                    path: external.clone(),
+                    format: BlobFormat::Raw,
+                    mode: ImportMode::TryReference,
+                })
+                .temp_tag()
+                .await?;
             store.wait_idle().await?;
             gc_run_once(&store, &mut HashSet::new()).await?;
             assert_eq!(store.get_bytes(tag.hash()).await?, data);
@@ -2078,7 +2095,8 @@ pub mod tests {
             assert_eq!(std::fs::read(&external)?, data);
             store.shutdown().await?;
             Ok(())
-        }).await?
+        })
+        .await?
     }
 
     async fn test_batch(store: &Store) -> TestResult<()> {

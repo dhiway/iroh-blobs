@@ -221,10 +221,12 @@ mod entity_actor {
             // here we also give back the rest of ourselves so the main actor can recycle us.
             // The manager observes cancellation if persistence panics or this
             // actor is aborted after handing back its receiver.
-            completed.send(ShutdownComplete {
-                state: self.state,
-                tasks: self.tasks,
-            }).ok();
+            completed
+                .send(ShutdownComplete {
+                    state: self.state,
+                    tasks: self.tasks,
+                })
+                .ok();
         }
 
         /// Recycle the actor for reuse by setting its state to default.
@@ -260,7 +262,10 @@ mod main_actor {
     use std::{collections::HashMap, future::Future};
 
     use n0_future::{future, FuturesUnordered, StreamExt};
-    use tokio::{sync::{mpsc, oneshot}, task::JoinSet};
+    use tokio::{
+        sync::{mpsc, oneshot},
+        task::JoinSet,
+    };
     use tracing::{error, warn};
 
     use super::{
@@ -289,7 +294,10 @@ mod main_actor {
         }
     }
 
-    type Completion<P> = (<P as Params>::EntityId, Result<ShutdownComplete<P>, oneshot::error::RecvError>);
+    type Completion<P> = (
+        <P as Params>::EntityId,
+        Result<ShutdownComplete<P>, oneshot::error::RecvError>,
+    );
 
     enum Lifecycle<P: Params> {
         Handback(InternalCommand<P>),
@@ -441,12 +449,8 @@ mod main_actor {
         /// Admit one command without turning transient inbox pressure into Busy.
         /// The caller owns the returned actor tasks; no task is created per waiter.
         /// Other entity lifecycle work continues while this one command waits.
-        pub async fn spawn_wait<F, Fut>(
-            &mut self,
-            id: P::EntityId,
-            f: F,
-            tasks: &mut JoinSet<()>,
-        ) where
+        pub async fn spawn_wait<F, Fut>(&mut self, id: P::EntityId, f: F, tasks: &mut JoinSet<()>)
+        where
             F: FnOnce(SpawnArg<P>) -> Fut + Send + 'static,
             Fut: Future<Output = ()> + Send + 'static,
         {
@@ -458,12 +462,16 @@ mod main_actor {
             // without a suspension at which cancellation could strand it empty.
             let (handle, task) = self.get_or_create(id.clone());
             let result = handle.send().try_send(command);
-            if let Some(task) = task { tasks.spawn(task); }
+            if let Some(task) = task {
+                tasks.spawn(task);
+            }
             match result {
                 Ok(()) => return,
                 Err(mpsc::error::TrySendError::Full(pending)) => command = pending,
                 Err(mpsc::error::TrySendError::Closed(pending)) => {
-                    let entity_actor::Command::Spawn(spawn) = pending else { unreachable!() };
+                    let entity_actor::Command::Spawn(spawn) = pending else {
+                        unreachable!()
+                    };
                     (spawn.f)(SpawnArg::Dead).await;
                     return;
                 }
@@ -475,10 +483,15 @@ mod main_actor {
                 if !self.live.contains_key(&id) {
                     let (handle, task) = self.get_or_create(id.clone());
                     assert!(handle.send().try_send(command).is_ok());
-                    if let Some(task) = task { tasks.spawn(task); }
+                    if let Some(task) = task {
+                        tasks.spawn(task);
+                    }
                     return;
                 }
-                enum Ready<P: Params> { Closed, Lifecycle(Lifecycle<P>) }
+                enum Ready<P: Params> {
+                    Closed,
+                    Lifecycle(Lifecycle<P>),
+                }
                 // Borrow the unique sender only for the reservation. Drop that
                 // borrow before mutating/recycling the corresponding handle.
                 let ready = {
@@ -496,12 +509,16 @@ mod main_actor {
                 };
                 match ready {
                     Ready::Closed => {
-                        let entity_actor::Command::Spawn(spawn) = command else { unreachable!() };
+                        let entity_actor::Command::Spawn(spawn) = command else {
+                            unreachable!()
+                        };
                         (spawn.f)(SpawnArg::Dead).await;
                         return;
                     }
                     Ready::Lifecycle(event) => {
-                        if let Some(task) = self.lifecycle(event) { tasks.spawn(task); }
+                        if let Some(task) = self.lifecycle(event) {
+                            tasks.spawn(task);
+                        }
                     }
                 }
             }
@@ -521,18 +538,33 @@ mod main_actor {
             !self.internal_recv.is_empty() || !self.completions.is_empty()
         }
 
-        fn lifecycle(&mut self, event: Lifecycle<P>) -> Option<impl Future<Output = ()> + Send + 'static> {
+        fn lifecycle(
+            &mut self,
+            event: Lifecycle<P>,
+        ) -> Option<impl Future<Output = ()> + Send + 'static> {
             match event {
-                Lifecycle::Handback(InternalCommand::Shutdown(Shutdown { id, receiver, completed })) => {
+                Lifecycle::Handback(InternalCommand::Shutdown(Shutdown {
+                    id,
+                    receiver,
+                    completed,
+                })) => {
                     let Some(EntityHandle::Live { send }) = self.live.remove(&id) else {
                         error!("Unexpected receiver handback for entity {id:?}");
                         return None;
                     };
-                    self.live.insert(id.clone(), EntityHandle::ShuttingDown { send, recv: receiver });
-                    self.completions.push(Box::pin(async move { (id, completed.await) }));
+                    self.live.insert(
+                        id.clone(),
+                        EntityHandle::ShuttingDown {
+                            send,
+                            recv: receiver,
+                        },
+                    );
+                    self.completions
+                        .push(Box::pin(async move { (id, completed.await) }));
                 }
                 Lifecycle::Completed((id, result)) => {
-                    let Some(EntityHandle::ShuttingDown { send, recv }) = self.live.remove(&id) else {
+                    let Some(EntityHandle::ShuttingDown { send, recv }) = self.live.remove(&id)
+                    else {
                         error!("Unexpected shutdown completion for entity {id:?}");
                         return None;
                     };
@@ -545,7 +577,10 @@ mod main_actor {
                         return None;
                     };
                     let mut actor = entity_actor::Actor {
-                        main: self.internal_send.clone(), recv, state, tasks,
+                        main: self.internal_send.clone(),
+                        recv,
+                        state,
+                        tasks,
                     };
                     if actor.recv.is_empty() {
                         self.recycle(send, actor);
@@ -878,7 +913,9 @@ mod tests {
         }
         #[derive(Debug, Default, Clone)]
         struct Empty;
-        impl Reset for Empty { fn reset(&mut self) {} }
+        impl Reset for Empty {
+            fn reset(&mut self) {}
+        }
         struct Fixture;
         impl Params for Fixture {
             type EntityId = u64;
@@ -888,30 +925,63 @@ mod tests {
                 if cause == ShutdownCause::Idle {
                     let _ = state.global.entered.send(state.id);
                     state.global.gate.acquire().await.unwrap().forget();
-                    assert!(!state.global.panic, "injected persistence panic after handback");
+                    assert!(
+                        !state.global.panic,
+                        "injected persistence panic after handback"
+                    );
                 }
             }
         }
-        fn fixture(panic: bool) -> (EntityManagerState<Fixture>, JoinSet<()>, mpsc::UnboundedReceiver<u64>, Arc<Semaphore>) {
+        fn fixture(
+            panic: bool,
+        ) -> (
+            EntityManagerState<Fixture>,
+            JoinSet<()>,
+            mpsc::UnboundedReceiver<u64>,
+            Arc<Semaphore>,
+        ) {
             let (entered, receive) = mpsc::unbounded_channel();
             let gate = Arc::new(Semaphore::new(0));
-            let global = Global { entered, gate: gate.clone(), panic };
-            (EntityManagerState::new(global, 2, 1, 1, 1), JoinSet::new(), receive, gate)
+            let global = Global {
+                entered,
+                gate: gate.clone(),
+                panic,
+            };
+            (
+                EntityManagerState::new(global, 2, 1, 1, 1),
+                JoinSet::new(),
+                receive,
+                gate,
+            )
         }
         fn answer(arg: SpawnArg<Fixture>, tx: oneshot::Sender<u8>) -> impl Future<Output = ()> {
             async move {
-                let value = match arg { SpawnArg::Active(_) => 1, SpawnArg::Busy => 2, SpawnArg::Dead => 3 };
+                let value = match arg {
+                    SpawnArg::Active(_) => 1,
+                    SpawnArg::Busy => 2,
+                    SpawnArg::Dead => 3,
+                };
                 let _ = tx.send(value);
             }
         }
-        async fn parked(manager: &mut EntityManagerState<Fixture>, tasks: &mut JoinSet<()>, entered: &mut mpsc::UnboundedReceiver<u64>) {
+        async fn parked(
+            manager: &mut EntityManagerState<Fixture>,
+            tasks: &mut JoinSet<()>,
+            entered: &mut mpsc::UnboundedReceiver<u64>,
+        ) {
             let (tx, rx) = oneshot::channel();
-            if let Some(task) = manager.spawn(1, move |arg| answer(arg, tx)).await { tasks.spawn(task); }
+            if let Some(task) = manager.spawn(1, move |arg| answer(arg, tx)).await {
+                tasks.spawn(task);
+            }
             assert_eq!(rx.await.unwrap(), 1);
             assert_eq!(entered.recv().await, Some(1));
             assert!(manager.tick().await.is_none());
         }
-        async fn drive(manager: &mut EntityManagerState<Fixture>, tasks: &mut JoinSet<()>, mut reply: oneshot::Receiver<u8>) -> u8 {
+        async fn drive(
+            manager: &mut EntityManagerState<Fixture>,
+            tasks: &mut JoinSet<()>,
+            mut reply: oneshot::Receiver<u8>,
+        ) -> u8 {
             timeout(Duration::from_secs(5), async {
                 loop {
                     tokio::select! {
@@ -920,7 +990,9 @@ mod tests {
                         Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     }
                 }
-            }).await.expect("entity progress")
+            })
+            .await
+            .expect("entity progress")
         }
 
         #[tokio::test]
@@ -928,15 +1000,26 @@ mod tests {
             let (mut manager, mut tasks, mut entered, gate) = fixture(false);
             parked(&mut manager, &mut tasks, &mut entered).await;
             let (queued, queued_rx) = oneshot::channel();
-            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            assert!(manager
+                .spawn(1, move |arg| answer(arg, queued))
+                .await
+                .is_none());
             let (busy, busy_rx) = oneshot::channel();
-            assert!(manager.spawn(1, move |arg| answer(arg, busy)).await.is_none());
+            assert!(manager
+                .spawn(1, move |arg| answer(arg, busy))
+                .await
+                .is_none());
             assert_eq!(busy_rx.await.unwrap(), 2);
             let (deferred, deferred_rx) = oneshot::channel();
-            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
-            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            let mut admission =
+                Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission)
+                .await
+                .is_err());
             gate.add_permits(16);
-            timeout(Duration::from_secs(5), &mut admission).await.unwrap();
+            timeout(Duration::from_secs(5), &mut admission)
+                .await
+                .unwrap();
             drop(admission);
             assert_eq!(drive(&mut manager, &mut tasks, queued_rx).await, 1);
             assert_eq!(drive(&mut manager, &mut tasks, deferred_rx).await, 1);
@@ -948,17 +1031,27 @@ mod tests {
             let (mut manager, mut tasks, mut entered, gate) = fixture(true);
             parked(&mut manager, &mut tasks, &mut entered).await;
             let (queued, queued_rx) = oneshot::channel();
-            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            assert!(manager
+                .spawn(1, move |arg| answer(arg, queued))
+                .await
+                .is_none());
             let (deferred, deferred_rx) = oneshot::channel();
-            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
-            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            let mut admission =
+                Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission)
+                .await
+                .is_err());
             gate.add_permits(1);
-            timeout(Duration::from_secs(5), &mut admission).await.unwrap();
+            timeout(Duration::from_secs(5), &mut admission)
+                .await
+                .unwrap();
             drop(admission);
             assert!(queued_rx.await.is_err());
             assert_eq!(deferred_rx.await.unwrap(), 3);
             let (again, again_rx) = oneshot::channel();
-            manager.spawn_wait(1, move |arg| answer(arg, again), &mut tasks).await;
+            manager
+                .spawn_wait(1, move |arg| answer(arg, again), &mut tasks)
+                .await;
             assert_eq!(again_rx.await.unwrap(), 3);
             tasks.abort_all();
         }
@@ -968,16 +1061,24 @@ mod tests {
             let (mut manager, mut tasks, mut entered, gate) = fixture(false);
             parked(&mut manager, &mut tasks, &mut entered).await;
             let (queued, queued_rx) = oneshot::channel();
-            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            assert!(manager
+                .spawn(1, move |arg| answer(arg, queued))
+                .await
+                .is_none());
             let (cancelled, cancelled_rx) = oneshot::channel();
-            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, cancelled), &mut tasks));
-            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            let mut admission =
+                Box::pin(manager.spawn_wait(1, move |arg| answer(arg, cancelled), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission)
+                .await
+                .is_err());
             drop(admission);
             assert!(cancelled_rx.await.is_err());
             gate.add_permits(16);
             assert_eq!(drive(&mut manager, &mut tasks, queued_rx).await, 1);
             let (distinct, distinct_rx) = oneshot::channel();
-            manager.spawn_wait(2, move |arg| answer(arg, distinct), &mut tasks).await;
+            manager
+                .spawn_wait(2, move |arg| answer(arg, distinct), &mut tasks)
+                .await;
             assert_eq!(drive(&mut manager, &mut tasks, distinct_rx).await, 1);
             tasks.abort_all();
         }
@@ -987,33 +1088,48 @@ mod tests {
             let (mut manager, mut tasks, mut entered, gate) = fixture(false);
             parked(&mut manager, &mut tasks, &mut entered).await;
             let (queued, queued_rx) = oneshot::channel();
-            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            assert!(manager
+                .spawn(1, move |arg| answer(arg, queued))
+                .await
+                .is_none());
             // More retiring entities than the single-slot lifecycle channel.
             let mut replies = Vec::new();
             for id in 2..10 {
                 let (tx, rx) = oneshot::channel();
-                let mut first_poll = Box::pin(manager.spawn_wait(id, move |arg| answer(arg, tx), &mut tasks));
+                let mut first_poll =
+                    Box::pin(manager.spawn_wait(id, move |arg| answer(arg, tx), &mut tasks));
                 assert!(futures_poll_ready(first_poll.as_mut()));
                 drop(first_poll);
                 replies.push(rx);
             }
             let (deferred, deferred_rx) = oneshot::channel();
-            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
-            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            let mut admission =
+                Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission)
+                .await
+                .is_err());
             gate.add_permits(64);
-            timeout(Duration::from_secs(5), &mut admission).await.unwrap();
+            timeout(Duration::from_secs(5), &mut admission)
+                .await
+                .unwrap();
             drop(admission);
             assert_eq!(drive(&mut manager, &mut tasks, queued_rx).await, 1);
             assert_eq!(drive(&mut manager, &mut tasks, deferred_rx).await, 1);
-            for rx in replies { assert_eq!(drive(&mut manager, &mut tasks, rx).await, 1); }
+            for rx in replies {
+                assert_eq!(drive(&mut manager, &mut tasks, rx).await, 1);
+            }
             tasks.abort_all();
         }
 
         fn futures_poll_ready<F: Future>(future: std::pin::Pin<&mut F>) -> bool {
             struct Wake;
-            impl std::task::Wake for Wake { fn wake(self: Arc<Self>) {} }
+            impl std::task::Wake for Wake {
+                fn wake(self: Arc<Self>) {}
+            }
             let waker = std::task::Waker::from(Arc::new(Wake));
-            future.poll(&mut std::task::Context::from_waker(&waker)).is_ready()
+            future
+                .poll(&mut std::task::Context::from_waker(&waker))
+                .is_ready()
         }
     }
 
