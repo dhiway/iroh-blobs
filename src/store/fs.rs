@@ -593,23 +593,41 @@ impl Actor {
                             format: cmd.format,
                         },
                     );
-                    (tt, cmd).spawn(&mut self.handles, &mut self.tasks).await;
+                    let hash = cmd.hash;
+                    self.handles.spawn_wait(hash, move |arg| async move {
+                        match arg {
+                            SpawnArg::Active(state) => (tt, cmd).handle(state).await,
+                            SpawnArg::Dead => (tt, cmd).on_error(arg).await,
+                            SpawnArg::Busy => unreachable!("waiting admission never returns Busy"),
+                        }
+                    }, &mut self.tasks).await;
                 }
             }
         }
     }
 
     async fn run(mut self) {
+        let mut ingress_closed = false;
         loop {
+            if ingress_closed && self.tasks.is_empty() && self.fs_cmd_rx.is_empty()
+                && !self.handles.has_pending_lifecycle()
+            {
+                break;
+            }
             tokio::select! {
                 task = self.handles.tick() => {
                     if let Some(task) = task {
                         self.spawn(task);
                     }
                 }
-                cmd = self.cmd_rx.recv() => {
+                cmd = self.cmd_rx.recv(), if !ingress_closed => {
                     let Some(cmd) = cmd else {
-                        break;
+                        ingress_closed = true;
+                        // Release preprocessing tasks blocked on internal ingress,
+                        // then drain its already accepted commands with lifecycle
+                        // handling still active through the last entity restart.
+                        self.fs_cmd_rx.close();
+                        continue;
                     };
                     self.handle_command(cmd).await;
                 }
@@ -2032,6 +2050,35 @@ pub mod tests {
             store.shutdown().await?;
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_import_temporary_retention_gc_and_external_ownership() -> TestResult {
+        use crate::api::blobs::AddPathOptions;
+        use crate::store::gc::gc_run_once;
+        use tokio::time::{timeout, Duration};
+        timeout(Duration::from_secs(60), async {
+            let directory = tempfile::tempdir()?;
+            let external = directory.path().join("caller-owned.data");
+            let data = vec![0x42; 128 * 1024];
+            std::fs::write(&external, &data)?;
+            let store = FsStore::load(directory.path().join("db")).await?;
+            let tag = store.add_path_with_opts(AddPathOptions {
+                path: external.clone(), format: BlobFormat::Raw,
+                mode: ImportMode::TryReference,
+            }).temp_tag().await?;
+            store.wait_idle().await?;
+            gc_run_once(&store, &mut HashSet::new()).await?;
+            assert_eq!(store.get_bytes(tag.hash()).await?, data);
+            let hash = tag.hash();
+            drop(tag);
+            gc_run_once(&store, &mut HashSet::new()).await?;
+            store.wait_idle().await?;
+            assert!(store.get_bytes(hash).await.is_err());
+            assert_eq!(std::fs::read(&external)?, data);
+            store.shutdown().await?;
+            Ok(())
+        }).await?
     }
 
     async fn test_batch(store: &Store) -> TestResult<()> {

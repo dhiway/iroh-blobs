@@ -84,6 +84,7 @@ pub enum SpawnArg<P: Params> {
 struct Shutdown<P: Params> {
     id: P::EntityId,
     receiver: mpsc::Receiver<entity_actor::Command<P>>,
+    completed: oneshot::Receiver<ShutdownComplete<P>>,
 }
 
 struct ShutdownAll {
@@ -102,7 +103,7 @@ struct ShutdownComplete<P: Params> {
 mod entity_actor {
     #![allow(dead_code)]
     use n0_future::{future, FuturesUnordered, StreamExt};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
 
     use super::{
         EntityShutdown, Params, Reset, Shutdown, ShutdownCause, ShutdownComplete, Spawn, SpawnArg,
@@ -203,11 +204,13 @@ mod entity_actor {
             );
             // notify main actor that we are starting to shut down.
             // if the main actor is shutting down, this could fail, but we don't care.
+            let (completed, completion) = oneshot::channel();
             self.main
                 .send(
                     Shutdown {
                         id: self.state.id.clone(),
                         receiver: self.recv,
+                        completed: completion,
                     }
                     .into(),
                 )
@@ -216,16 +219,12 @@ mod entity_actor {
             P::on_shutdown(self.state.clone(), ShutdownCause::Idle).await;
             // Notify the main actor that we have completed shutdown.
             // here we also give back the rest of ourselves so the main actor can recycle us.
-            self.main
-                .send(
-                    ShutdownComplete {
-                        state: self.state,
-                        tasks: self.tasks,
-                    }
-                    .into(),
-                )
-                .await
-                .ok();
+            // The manager observes cancellation if persistence panics or this
+            // actor is aborted after handing back its receiver.
+            completed.send(ShutdownComplete {
+                state: self.state,
+                tasks: self.tasks,
+            }).ok();
         }
 
         /// Recycle the actor for reuse by setting its state to default.
@@ -260,8 +259,8 @@ mod main_actor {
     #![allow(dead_code)]
     use std::{collections::HashMap, future::Future};
 
-    use n0_future::{future, FuturesUnordered};
-    use tokio::{sync::mpsc, task::JoinSet};
+    use n0_future::{future, FuturesUnordered, StreamExt};
+    use tokio::{sync::{mpsc, oneshot}, task::JoinSet};
     use tracing::{error, warn};
 
     use super::{
@@ -281,7 +280,6 @@ mod main_actor {
     }
 
     pub(super) enum InternalCommand<P: Params> {
-        ShutdownComplete(ShutdownComplete<P>),
         Shutdown(Shutdown<P>),
     }
 
@@ -291,10 +289,11 @@ mod main_actor {
         }
     }
 
-    impl<P: Params> From<ShutdownComplete<P>> for InternalCommand<P> {
-        fn from(shutdown_complete: ShutdownComplete<P>) -> Self {
-            Self::ShutdownComplete(shutdown_complete)
-        }
+    type Completion<P> = (<P as Params>::EntityId, Result<ShutdownComplete<P>, oneshot::error::RecvError>);
+
+    enum Lifecycle<P: Params> {
+        Handback(InternalCommand<P>),
+        Completed(Completion<P>),
     }
 
     #[derive(Debug)]
@@ -322,13 +321,14 @@ mod main_actor {
     ///
     /// This is if you don't want a separate manager actor, but want to inline the entity
     /// actor management into your main actor.
-    #[derive(Debug)]
     pub struct ActorState<P: Params> {
         /// Channel to receive internal commands from the entity actors.
         /// This channel will never be closed since we also hold a sender to it.
         internal_recv: mpsc::Receiver<InternalCommand<P>>,
         /// Channel to send internal commands to ourselves, to hand out to entity actors.
         internal_send: mpsc::Sender<InternalCommand<P>>,
+        /// Owned across cancellation of tick or deferred admission.
+        completions: FuturesUnordered<future::Boxed<Completion<P>>>,
         /// Map of live entity actors.
         live: HashMap<P::EntityId, EntityHandle<P>>,
         /// Global state shared across all entity actors.
@@ -344,6 +344,16 @@ mod main_actor {
         entity_futures_initial_capacity: usize,
     }
 
+    impl<P: Params> std::fmt::Debug for ActorState<P> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("ActorState")
+                .field("live", &self.live.len())
+                .field("retiring", &self.completions.len())
+                .field("pooled", &self.pool.len())
+                .finish()
+        }
+    }
+
     impl<P: Params> ActorState<P> {
         pub fn new(
             state: P::GlobalState,
@@ -356,6 +366,7 @@ mod main_actor {
             Self {
                 internal_recv,
                 internal_send,
+                completions: FuturesUnordered::new(),
                 live: HashMap::new(),
                 state,
                 pool: Vec::with_capacity(pool_capacity),
@@ -427,61 +438,121 @@ mod main_actor {
             task
         }
 
-        /// This function needs to be polled by the owner of the actor state to advance the
-        /// entity manager state machine. If it returns a future, that future must be spawned
-        /// by the caller.
+        /// Admit one command without turning transient inbox pressure into Busy.
+        /// The caller owns the returned actor tasks; no task is created per waiter.
+        /// Other entity lifecycle work continues while this one command waits.
+        pub async fn spawn_wait<F, Fut>(
+            &mut self,
+            id: P::EntityId,
+            f: F,
+            tasks: &mut JoinSet<()>,
+        ) where
+            F: FnOnce(SpawnArg<P>) -> Fut + Send + 'static,
+            Fut: Future<Output = ()> + Send + 'static,
+        {
+            let mut command = entity_actor::Command::Spawn(Spawn {
+                id: id.clone(),
+                f: Box::new(|arg| Box::pin(f(arg))),
+            });
+            // A fresh/recycled actor gets its first command before it is spawned,
+            // without a suspension at which cancellation could strand it empty.
+            let (handle, task) = self.get_or_create(id.clone());
+            let result = handle.send().try_send(command);
+            if let Some(task) = task { tasks.spawn(task); }
+            match result {
+                Ok(()) => return,
+                Err(mpsc::error::TrySendError::Full(pending)) => command = pending,
+                Err(mpsc::error::TrySendError::Closed(pending)) => {
+                    let entity_actor::Command::Spawn(spawn) = pending else { unreachable!() };
+                    (spawn.f)(SpawnArg::Dead).await;
+                    return;
+                }
+            }
+            loop {
+                // Lifecycle completion may have pooled an actor after its last
+                // queued command drained. The deferred command still belongs to
+                // us, so start it as the first command of the recycled actor.
+                if !self.live.contains_key(&id) {
+                    let (handle, task) = self.get_or_create(id.clone());
+                    assert!(handle.send().try_send(command).is_ok());
+                    if let Some(task) = task { tasks.spawn(task); }
+                    return;
+                }
+                enum Ready<P: Params> { Closed, Lifecycle(Lifecycle<P>) }
+                // Borrow the unique sender only for the reservation. Drop that
+                // borrow before mutating/recycling the corresponding handle.
+                let ready = {
+                    let sender = self.live.get(&id).expect("waiting entity exists").send();
+                    tokio::select! {
+                        permit = sender.reserve() => {
+                            match permit {
+                                Ok(permit) => { permit.send(command); return; }
+                                Err(_) => Ready::Closed,
+                            }
+                        }
+                        Some(cmd) = self.internal_recv.recv() => Ready::Lifecycle(Lifecycle::Handback(cmd)),
+                        Some(done) = self.completions.next(), if !self.completions.is_empty() => Ready::Lifecycle(Lifecycle::Completed(done)),
+                    }
+                };
+                match ready {
+                    Ready::Closed => {
+                        let entity_actor::Command::Spawn(spawn) = command else { unreachable!() };
+                        (spawn.f)(SpawnArg::Dead).await;
+                        return;
+                    }
+                    Ready::Lifecycle(event) => {
+                        if let Some(task) = self.lifecycle(event) { tasks.spawn(task); }
+                    }
+                }
+            }
+        }
+
+        /// Advance idle receiver handback and its terminal persistence result.
         #[must_use = "this function may return a future that must be spawned by the caller"]
         pub async fn tick(&mut self) -> Option<impl Future<Output = ()> + Send + 'static> {
-            if let Some(cmd) = self.internal_recv.recv().await {
-                match cmd {
-                    InternalCommand::Shutdown(Shutdown { id, receiver }) => {
-                        let Some(entity_handle) = self.live.remove(&id) else {
-                            error!("Received shutdown command for unknown entity actor {id:?}");
-                            return None;
-                        };
-                        let EntityHandle::Live { send } = entity_handle else {
-                            error!(
-                                "Received shutdown command for entity actor {id:?} that is already shutting down"
-                            );
-                            return None;
-                        };
-                        self.live.insert(
-                            id.clone(),
-                            EntityHandle::ShuttingDown {
-                                send,
-                                recv: receiver,
-                            },
-                        );
-                    }
-                    InternalCommand::ShutdownComplete(ShutdownComplete { state, tasks }) => {
-                        let id = state.id.clone();
-                        let Some(entity_handle) = self.live.remove(&id) else {
-                            error!(
-                                "Received shutdown complete command for unknown entity actor {id:?}"
-                            );
-                            return None;
-                        };
-                        let EntityHandle::ShuttingDown { send, recv } = entity_handle else {
-                            error!(
-                                "Received shutdown complete command for entity actor {id:?} that is not shutting down"
-                            );
-                            return None;
-                        };
-                        // re-assemble the actor from the parts
-                        let mut actor = entity_actor::Actor {
-                            main: self.internal_send.clone(),
-                            recv,
-                            state,
-                            tasks,
-                        };
-                        if actor.recv.is_empty() {
-                            // No commands during shutdown, we can recycle the actor.
-                            self.recycle(send, actor);
-                        } else {
-                            actor.state.state.reset();
-                            self.live.insert(id.clone(), EntityHandle::Live { send });
-                            return Some(actor.run());
-                        }
+            let event = tokio::select! {
+                Some(cmd) = self.internal_recv.recv() => Lifecycle::Handback(cmd),
+                Some(done) = self.completions.next(), if !self.completions.is_empty() => Lifecycle::Completed(done),
+            };
+            self.lifecycle(event)
+        }
+
+        pub fn has_pending_lifecycle(&self) -> bool {
+            !self.internal_recv.is_empty() || !self.completions.is_empty()
+        }
+
+        fn lifecycle(&mut self, event: Lifecycle<P>) -> Option<impl Future<Output = ()> + Send + 'static> {
+            match event {
+                Lifecycle::Handback(InternalCommand::Shutdown(Shutdown { id, receiver, completed })) => {
+                    let Some(EntityHandle::Live { send }) = self.live.remove(&id) else {
+                        error!("Unexpected receiver handback for entity {id:?}");
+                        return None;
+                    };
+                    self.live.insert(id.clone(), EntityHandle::ShuttingDown { send, recv: receiver });
+                    self.completions.push(Box::pin(async move { (id, completed.await) }));
+                }
+                Lifecycle::Completed((id, result)) => {
+                    let Some(EntityHandle::ShuttingDown { send, recv }) = self.live.remove(&id) else {
+                        error!("Unexpected shutdown completion for entity {id:?}");
+                        return None;
+                    };
+                    let Ok(ShutdownComplete { state, tasks }) = result else {
+                        // Drop the parked receiver, including buffered reply owners.
+                        // Keep the now-closed sender: get_or_create must never revive
+                        // an entity whose persistence did not finish successfully.
+                        drop(recv);
+                        self.live.insert(id, EntityHandle::Live { send });
+                        return None;
+                    };
+                    let mut actor = entity_actor::Actor {
+                        main: self.internal_send.clone(), recv, state, tasks,
+                    };
+                    if actor.recv.is_empty() {
+                        self.recycle(send, actor);
+                    } else {
+                        actor.state.state.reset();
+                        self.live.insert(id, EntityHandle::Live { send });
+                        return Some(actor.run());
                     }
                 }
             }
@@ -793,6 +864,158 @@ mod tests {
     use testresult::TestResult;
 
     use super::*;
+
+    mod deferred {
+        use super::*;
+        use std::{sync::Arc, time::Duration};
+        use tokio::{sync::Semaphore, task::JoinSet, time::timeout};
+
+        #[derive(Debug, Clone)]
+        struct Global {
+            entered: mpsc::UnboundedSender<u64>,
+            gate: Arc<Semaphore>,
+            panic: bool,
+        }
+        #[derive(Debug, Default, Clone)]
+        struct Empty;
+        impl Reset for Empty { fn reset(&mut self) {} }
+        struct Fixture;
+        impl Params for Fixture {
+            type EntityId = u64;
+            type GlobalState = Global;
+            type EntityState = Empty;
+            async fn on_shutdown(state: ActiveEntityState<Self>, cause: ShutdownCause) {
+                if cause == ShutdownCause::Idle {
+                    let _ = state.global.entered.send(state.id);
+                    state.global.gate.acquire().await.unwrap().forget();
+                    assert!(!state.global.panic, "injected persistence panic after handback");
+                }
+            }
+        }
+        fn fixture(panic: bool) -> (EntityManagerState<Fixture>, JoinSet<()>, mpsc::UnboundedReceiver<u64>, Arc<Semaphore>) {
+            let (entered, receive) = mpsc::unbounded_channel();
+            let gate = Arc::new(Semaphore::new(0));
+            let global = Global { entered, gate: gate.clone(), panic };
+            (EntityManagerState::new(global, 2, 1, 1, 1), JoinSet::new(), receive, gate)
+        }
+        fn answer(arg: SpawnArg<Fixture>, tx: oneshot::Sender<u8>) -> impl Future<Output = ()> {
+            async move {
+                let value = match arg { SpawnArg::Active(_) => 1, SpawnArg::Busy => 2, SpawnArg::Dead => 3 };
+                let _ = tx.send(value);
+            }
+        }
+        async fn parked(manager: &mut EntityManagerState<Fixture>, tasks: &mut JoinSet<()>, entered: &mut mpsc::UnboundedReceiver<u64>) {
+            let (tx, rx) = oneshot::channel();
+            if let Some(task) = manager.spawn(1, move |arg| answer(arg, tx)).await { tasks.spawn(task); }
+            assert_eq!(rx.await.unwrap(), 1);
+            assert_eq!(entered.recv().await, Some(1));
+            assert!(manager.tick().await.is_none());
+        }
+        async fn drive(manager: &mut EntityManagerState<Fixture>, tasks: &mut JoinSet<()>, mut reply: oneshot::Receiver<u8>) -> u8 {
+            timeout(Duration::from_secs(5), async {
+                loop {
+                    tokio::select! {
+                        reply = &mut reply => return reply.unwrap(),
+                        next = manager.tick() => if let Some(task) = next { tasks.spawn(task); },
+                        Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
+                    }
+                }
+            }).await.expect("entity progress")
+        }
+
+        #[tokio::test]
+        async fn full_parked_inbox_waits_and_legacy_busy_is_preserved() {
+            let (mut manager, mut tasks, mut entered, gate) = fixture(false);
+            parked(&mut manager, &mut tasks, &mut entered).await;
+            let (queued, queued_rx) = oneshot::channel();
+            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            let (busy, busy_rx) = oneshot::channel();
+            assert!(manager.spawn(1, move |arg| answer(arg, busy)).await.is_none());
+            assert_eq!(busy_rx.await.unwrap(), 2);
+            let (deferred, deferred_rx) = oneshot::channel();
+            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            gate.add_permits(16);
+            timeout(Duration::from_secs(5), &mut admission).await.unwrap();
+            drop(admission);
+            assert_eq!(drive(&mut manager, &mut tasks, queued_rx).await, 1);
+            assert_eq!(drive(&mut manager, &mut tasks, deferred_rx).await, 1);
+            tasks.abort_all();
+        }
+
+        #[tokio::test]
+        async fn persistence_panic_closes_parked_replies_and_never_revives_entity() {
+            let (mut manager, mut tasks, mut entered, gate) = fixture(true);
+            parked(&mut manager, &mut tasks, &mut entered).await;
+            let (queued, queued_rx) = oneshot::channel();
+            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            let (deferred, deferred_rx) = oneshot::channel();
+            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            gate.add_permits(1);
+            timeout(Duration::from_secs(5), &mut admission).await.unwrap();
+            drop(admission);
+            assert!(queued_rx.await.is_err());
+            assert_eq!(deferred_rx.await.unwrap(), 3);
+            let (again, again_rx) = oneshot::channel();
+            manager.spawn_wait(1, move |arg| answer(arg, again), &mut tasks).await;
+            assert_eq!(again_rx.await.unwrap(), 3);
+            tasks.abort_all();
+        }
+
+        #[tokio::test]
+        async fn cancellation_drops_only_deferred_work_and_manager_still_progresses() {
+            let (mut manager, mut tasks, mut entered, gate) = fixture(false);
+            parked(&mut manager, &mut tasks, &mut entered).await;
+            let (queued, queued_rx) = oneshot::channel();
+            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            let (cancelled, cancelled_rx) = oneshot::channel();
+            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, cancelled), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            drop(admission);
+            assert!(cancelled_rx.await.is_err());
+            gate.add_permits(16);
+            assert_eq!(drive(&mut manager, &mut tasks, queued_rx).await, 1);
+            let (distinct, distinct_rx) = oneshot::channel();
+            manager.spawn_wait(2, move |arg| answer(arg, distinct), &mut tasks).await;
+            assert_eq!(drive(&mut manager, &mut tasks, distinct_rx).await, 1);
+            tasks.abort_all();
+        }
+
+        #[tokio::test]
+        async fn first_poll_admits_before_spawning_and_saturated_handbacks_drain() {
+            let (mut manager, mut tasks, mut entered, gate) = fixture(false);
+            parked(&mut manager, &mut tasks, &mut entered).await;
+            let (queued, queued_rx) = oneshot::channel();
+            assert!(manager.spawn(1, move |arg| answer(arg, queued)).await.is_none());
+            // More retiring entities than the single-slot lifecycle channel.
+            let mut replies = Vec::new();
+            for id in 2..10 {
+                let (tx, rx) = oneshot::channel();
+                let mut first_poll = Box::pin(manager.spawn_wait(id, move |arg| answer(arg, tx), &mut tasks));
+                assert!(futures_poll_ready(first_poll.as_mut()));
+                drop(first_poll);
+                replies.push(rx);
+            }
+            let (deferred, deferred_rx) = oneshot::channel();
+            let mut admission = Box::pin(manager.spawn_wait(1, move |arg| answer(arg, deferred), &mut tasks));
+            assert!(timeout(Duration::from_millis(10), &mut admission).await.is_err());
+            gate.add_permits(64);
+            timeout(Duration::from_secs(5), &mut admission).await.unwrap();
+            drop(admission);
+            assert_eq!(drive(&mut manager, &mut tasks, queued_rx).await, 1);
+            assert_eq!(drive(&mut manager, &mut tasks, deferred_rx).await, 1);
+            for rx in replies { assert_eq!(drive(&mut manager, &mut tasks, rx).await, 1); }
+            tasks.abort_all();
+        }
+
+        fn futures_poll_ready<F: Future>(future: std::pin::Pin<&mut F>) -> bool {
+            struct Wake;
+            impl std::task::Wake for Wake { fn wake(self: Arc<Self>) {} }
+            let waker = std::task::Waker::from(Arc::new(Wake));
+            future.poll(&mut std::task::Context::from_waker(&waker)).is_ready()
+        }
+    }
 
     // a simple database for u128 counters, identified by u64 ids.
     trait CounterDb {
