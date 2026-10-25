@@ -2062,6 +2062,134 @@ pub mod tests {
         Ok(())
     }
 
+    async fn native_import_actor_fixture(
+        path: &Path,
+    ) -> TestResult<(
+        Actor,
+        tokio::sync::mpsc::Sender<Command>,
+        tokio::sync::mpsc::Sender<InternalCommand>,
+    )> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_time()
+            .build()?;
+        let (commands, receive) = tokio::sync::mpsc::channel(1);
+        let (internal, internal_receive) = tokio::sync::mpsc::channel(1);
+        let mut actor = Actor::new(
+            path.join("blobs.db"),
+            runtime.into(),
+            receive,
+            internal_receive,
+            internal.clone(),
+            Arc::new(Options::new(path)),
+        )
+        .await?;
+        actor.handles = EntityManagerState::new(actor.context(), 2, 1, 2, 1);
+        Ok((actor, commands, internal))
+    }
+
+    fn native_import_entry(data: Bytes, tx: mpsc::Sender<AddProgressItem>) -> InternalCommand {
+        ImportEntryMsg {
+            inner: ImportEntry {
+                hash: Hash::new(&data),
+                format: crate::BlobFormat::Raw,
+                scope: Scope::GLOBAL,
+                source: ImportSource::Memory(data),
+                outboard: MemOrFile::empty(),
+            },
+            tx,
+            rx: irpc::channel::none::NoReceiver,
+            span: tracing::Span::none(),
+        }
+        .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_import_external_close_releases_full_internal_ingress() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let directory = tempfile::tempdir()?;
+            let (mut actor, commands, internal) = native_import_actor_fixture(directory.path()).await?;
+            internal.send(ClearScope { scope: Scope(123) }.into()).await?;
+            assert_eq!(internal.capacity(), 0);
+            let (entered, ready) = tokio::sync::oneshot::channel();
+            let (released, finished) = tokio::sync::oneshot::channel();
+            actor.tasks.spawn(async move {
+                entered.send(()).unwrap();
+                // This worker uses the same bounded ingress as preprocessing.
+                // It can finish only when the actor closes that ingress.
+                while internal.send(ClearScope { scope: Scope(123) }.into()).await.is_ok() {}
+                released.send(()).unwrap();
+            });
+            ready.await?;
+            drop(commands);
+            actor.run().await;
+            finished.await?;
+            Ok(())
+        }).await?
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_import_external_close_drives_last_entity_restart() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let directory = tempfile::tempdir()?;
+            let (mut actor, commands, internal) = native_import_actor_fixture(directory.path()).await?;
+            let hash = Hash::new(b"queued across retirement");
+            let first = actor.handles.spawn(hash, |arg| async move {
+                assert!(matches!(arg, SpawnArg::Active(_)));
+            }).await.unwrap();
+            // Finish retirement while its handback remains buffered in the manager.
+            first.await;
+            assert!(actor.handles.has_pending_lifecycle());
+            let (completed, reply) = tokio::sync::oneshot::channel();
+            assert!(actor.handles.spawn(hash, move |arg| async move {
+                assert!(matches!(arg, SpawnArg::Active(_)));
+                completed.send(()).unwrap();
+            }).await.is_none());
+            drop(commands);
+            drop(internal);
+            actor.run().await;
+            reply.await?;
+            Ok(())
+        }).await?
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_import_lost_reader_after_deferred_admission_still_finishes() -> TestResult {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let directory = tempfile::tempdir()?;
+            let (mut actor, commands, internal) = native_import_actor_fixture(directory.path()).await?;
+            let data = Bytes::from_static(b"finish after its reader disappears");
+            let hash = Hash::new(&data);
+            // Keep the first actor unpolled, so its single-slot inbox is full.
+            let first = actor.handles.spawn(hash, |arg| async move {
+                assert!(matches!(arg, SpawnArg::Active(_)));
+            }).await.unwrap();
+            let (progress, reader) = mpsc::channel(1);
+            let mut admission = Box::pin(actor.handle_fs_command(native_import_entry(data.clone(), progress)));
+            assert!(tokio::time::timeout(std::time::Duration::from_millis(10), &mut admission).await.is_err());
+            // FinishImport is now waiting at native entity admission, not preprocessing.
+            drop(reader);
+            let first = tokio::spawn(first);
+            admission.await;
+            actor.tasks.spawn(async move { first.await.unwrap(); });
+            let store = FsStore::new(commands.into(), internal);
+            let running = tokio::spawn(actor.run());
+            // Admission is not completion; wait for actual native readback.
+            loop {
+                if store.get_bytes(hash).await.is_ok_and(|bytes| bytes == data) { break; }
+                tokio::task::yield_now().await;
+            }
+            loop {
+                let tags = store.tags().list_temp_tags().await?.collect::<Vec<_>>().await;
+                if !tags.iter().any(|value| value.hash == hash) { break; }
+                tokio::task::yield_now().await;
+            }
+            drop(store);
+            running.await?;
+            Ok(())
+        }).await?
+    }
+
     #[tokio::test]
     async fn native_import_temporary_retention_gc_and_external_ownership() -> TestResult {
         use crate::store::gc::gc_run_once;

@@ -127,30 +127,3 @@ async fn twenty_thousand_equal_batch_imports_and_scope_release() -> TestResult {
     })
     .await?
 }
-
-#[tokio::test]
-async fn lost_progress_readers_finish_without_holding_temp_tags() -> TestResult {
-    timeout(Duration::from_secs(60), async {
-        let directory = tempfile::tempdir()?;
-        let store = FsStore::load(directory.path()).await?;
-        let expected = Hash::new(b"abandoned local import");
-        for _ in 0..256 {
-            let progress = store
-                .add_bytes(Bytes::from_static(b"abandoned local import"))
-                .stream()
-                .await;
-            drop(progress);
-        }
-        store.wait_idle().await?;
-        let tags = store
-            .tags()
-            .list_temp_tags()
-            .await?
-            .collect::<Vec<_>>()
-            .await;
-        assert!(!tags.iter().any(|value| value.hash == expected));
-        store.shutdown().await?;
-        Ok(())
-    })
-    .await?
-}
