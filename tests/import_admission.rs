@@ -95,10 +95,14 @@ async fn twenty_thousand_equal_batch_imports_and_scope_release() -> TestResult {
                 async move { batch.add_bytes(data).await }
             })
             .buffered_unordered(CONCURRENCY);
+        let mut retained = None;
         while let Some(tag) = imports.next().await {
-            assert_eq!(tag?.hash(), expected);
+            let tag = tag?;
+            assert_eq!(tag.hash(), expected);
+            retained = Some(tag);
         }
         drop(imports);
+        assert_eq!(retained.as_ref().unwrap().hash(), expected);
         assert_eq!(store.get_bytes(expected).await?, data);
         let tags = store
             .tags()
@@ -117,6 +121,7 @@ async fn twenty_thousand_equal_batch_imports_and_scope_release() -> TestResult {
             .collect::<Vec<_>>()
             .await;
         assert!(!tags.iter().any(|value| value.hash == expected));
+        drop(retained);
         store.shutdown().await?;
         Ok(())
     })
