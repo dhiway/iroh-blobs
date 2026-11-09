@@ -954,15 +954,13 @@ mod tests {
                 gate,
             )
         }
-        fn answer(arg: SpawnArg<Fixture>, tx: oneshot::Sender<u8>) -> impl Future<Output = ()> {
-            async move {
-                let value = match arg {
-                    SpawnArg::Active(_) => 1,
-                    SpawnArg::Busy => 2,
-                    SpawnArg::Dead => 3,
-                };
-                let _ = tx.send(value);
-            }
+        async fn answer(arg: SpawnArg<Fixture>, tx: oneshot::Sender<u8>) {
+            let value = match arg {
+                SpawnArg::Active(_) => 1,
+                SpawnArg::Busy => 2,
+                SpawnArg::Dead => 3,
+            };
+            let _ = tx.send(value);
         }
         async fn parked(
             manager: &mut EntityManagerState<Fixture>,
