@@ -8,6 +8,7 @@ use iroh::{
 };
 use irpc::RpcMessage;
 use n0_future::{task::AbortOnDropHandle, StreamExt};
+use n0_tracing_test::traced_test;
 use tempfile::TempDir;
 use testresult::TestResult;
 use tokio::sync::{mpsc, watch};
@@ -16,7 +17,7 @@ use tracing::info;
 use crate::{
     api::{
         blobs::{Bitfield, BlobStatus},
-        Store,
+        RequestError, Store,
     },
     get,
     hashseq::HashSeq,
@@ -246,10 +247,89 @@ async fn two_nodes_get_blobs(
     Ok(())
 }
 
+/// A get over a closed connection fails to open its stream, which is a
+/// connection error, not a local failure.
+#[tokio::test]
+async fn get_over_closed_connection_is_open_error() -> TestResult<()> {
+    let ((r1, _store1), (r2, store2)) = two_node_test_setup_mem().await?;
+    let conn = r2
+        .endpoint()
+        .connect(r1.endpoint().addr(), crate::ALPN)
+        .await?;
+    conn.close(0u32.into(), b"done");
+    let Err(err) = store2.remote().fetch(conn, Hash::new(b"blob")).await else {
+        panic!("get over a closed connection succeeded");
+    };
+    assert!(err.open().is_some(), "{err:?}");
+    tokio::try_join!(r1.shutdown(), r2.shutdown())?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn two_nodes_get_blobs_fs() -> TestResult<()> {
     let (_testdir, (r1, store1, _), (r2, store2, _)) = two_node_test_setup_fs().await?;
     two_nodes_get_blobs(r1, &store1, r2, &store2).await
+}
+
+/// A get must fail if the local store fails to write the last batch.
+#[cfg(unix)]
+#[tokio::test]
+#[traced_test]
+async fn get_blob_store_write_error_fs() -> TestResult<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use iroh::endpoint::VarInt;
+
+    use crate::{
+        get::StreamPair,
+        protocol::GetRequest,
+        util::{AsyncWriteSendStream, AsyncWriteSendStreamExtra},
+    };
+
+    struct Sink(tokio::io::Sink);
+
+    impl AsyncWriteSendStreamExtra for Sink {
+        fn inner(&mut self) -> &mut (impl tokio::io::AsyncWrite + Unpin + Send) {
+            &mut self.0
+        }
+
+        fn reset(&mut self, _code: VarInt) -> io::Result<()> {
+            Ok(())
+        }
+
+        async fn stopped(&mut self) -> io::Result<Option<VarInt>> {
+            std::future::pending().await
+        }
+
+        fn id(&self) -> u64 {
+            0
+        }
+    }
+
+    let testdir = tempfile::tempdir()?;
+    let db_path = testdir.path().join("db");
+    let store = FsStore::load(&db_path).await?;
+    // just over the inline limit, so the entry has to go to disk. This is
+    // written in a single batch, so the first batch is also the last one.
+    let data = test_data(1024 * 16 + 1);
+    let (hash, response) = create_n0_bao(&data, &ChunkRanges::all())?;
+    // make it impossible to create the data file
+    let data_dir = db_path.join("data");
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o555))?;
+    if std::fs::File::create(data_dir.join("probe")).is_ok() {
+        // running as root, permissions are not enforced
+        return Ok(());
+    }
+    let sink = AsyncWriteSendStream::new(Sink(tokio::io::sink()));
+    let sp = StreamPair::new(0, Bytes::from(response), sink);
+    let res = store.remote().execute_get(sp, GetRequest::blob(hash)).await;
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755))?;
+    assert!(
+        matches!(res, Err(get::GetError::LocalFailure { .. })),
+        "{res:?}"
+    );
+    store.shutdown().await?;
+    Ok(())
 }
 
 #[tokio::test]
@@ -291,15 +371,15 @@ async fn two_nodes_observe(
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_observe_fs() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let (_testdir, (r1, store1, _), (r2, store2, _)) = two_node_test_setup_fs().await?;
     two_nodes_observe(r1, &store1, r2, &store2).await
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_observe_mem() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let ((r1, store1), (r2, store2)) = two_node_test_setup_mem().await?;
     two_nodes_observe(r1, &store1, r2, &store2).await
 }
@@ -333,15 +413,15 @@ async fn two_nodes_get_many(
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_get_many_fs() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let (_testdir, (r1, store1, _), (r2, store2, _)) = two_node_test_setup_fs().await?;
     two_nodes_get_many(r1, &store1, r2, &store2).await
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_get_many_mem() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let ((r1, store1), (r2, store2)) = two_node_test_setup_mem().await?;
     two_nodes_get_many(r1, &store1, r2, &store2).await
 }
@@ -419,8 +499,8 @@ async fn two_nodes_push_blobs(
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_push_blobs_fs() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let testdir = tempfile::tempdir()?;
     let (r1, store1, _, sp1) = node_test_setup_fs(testdir.path().join("a")).await?;
     let (events_tx, count_rx, _task) = event_handler([r1.endpoint().id()]);
@@ -471,8 +551,8 @@ async fn two_nodes_push_rejected(
 
 /// Push requests must be rejected with the default event mask.
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_push_rejected_default() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let ((r1, store1), (r2, store2)) = two_node_test_setup_mem().await?;
     two_nodes_push_rejected(r1, &store1, r2, &store2).await
 }
@@ -480,8 +560,8 @@ async fn two_nodes_push_rejected_default() -> TestResult<()> {
 /// Push requests must be rejected with [`EventMask::ALL_READONLY`], even if
 /// the event handler accepts every request it is asked about.
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_push_rejected_readonly() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let (r1, store1, sp1) = node_test_setup_mem().await?;
     let events = EventSender::DEFAULT.tracing(EventMask::ALL_READONLY);
     let (r2, store2, sp2) = node_test_setup_with_events_mem(events).await?;
@@ -491,8 +571,8 @@ async fn two_nodes_push_rejected_readonly() -> TestResult<()> {
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_push_blobs_mem() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let (r1, store1, sp1) = node_test_setup_mem().await?;
     let (events_tx, count_rx, _task) = event_handler([r1.endpoint().id()]);
     let (r2, store2, sp2) = node_test_setup_with_events_mem(events_tx).await?;
@@ -675,23 +755,22 @@ async fn two_nodes_hash_seq(
 }
 
 #[tokio::test]
-
+#[traced_test]
 async fn two_nodes_hash_seq_fs() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let (_testdir, (r1, store1, _), (r2, store2, _)) = two_node_test_setup_fs().await?;
     two_nodes_hash_seq(r1, &store1, r2, &store2).await
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_hash_seq_mem() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let ((r1, store1), (r2, store2)) = two_node_test_setup_mem().await?;
     two_nodes_hash_seq(r1, &store1, r2, &store2).await
 }
 
 #[tokio::test]
+#[traced_test]
 async fn two_nodes_hash_seq_progress() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let (_testdir, (r1, store1, _), (r2, store2, _)) = two_node_test_setup_fs().await?;
     let addr1 = r1.endpoint().addr();
     let sizes = INTERESTING_SIZES;
@@ -707,8 +786,8 @@ async fn two_nodes_hash_seq_progress() -> TestResult<()> {
 ///
 /// The client requests the hash sequence and the children, but does not store the data.
 #[tokio::test]
+#[traced_test]
 async fn node_serve_hash_seq() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let testdir = tempfile::tempdir()?;
     let db_path = testdir.path().join("db");
     let store = crate::store::fs::FsStore::load(&db_path).await?;
@@ -743,8 +822,8 @@ async fn node_serve_hash_seq() -> TestResult<()> {
 ///
 /// The client requests them all one by one, but does not store it.
 #[tokio::test]
+#[traced_test]
 async fn node_serve_blobs() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let testdir = tempfile::tempdir()?;
     let db_path = testdir.path().join("db");
     let store = crate::store::fs::FsStore::load(&db_path).await?;
@@ -777,8 +856,8 @@ async fn node_serve_blobs() -> TestResult<()> {
 }
 
 #[tokio::test]
+#[traced_test]
 async fn node_smoke_fs() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let testdir = tempfile::tempdir()?;
     let db_path = testdir.path().join("db");
     let store = crate::store::fs::FsStore::load(&db_path).await?;
@@ -786,8 +865,8 @@ async fn node_smoke_fs() -> TestResult<()> {
 }
 
 #[tokio::test]
+#[traced_test]
 async fn node_smoke_mem() -> TestResult<()> {
-    tracing_subscriber::fmt::try_init().ok();
     let store = crate::store::mem::MemStore::new();
     node_smoke(&store).await
 }
@@ -814,8 +893,8 @@ async fn node_smoke(store: &Store) -> TestResult<()> {
 }
 
 #[tokio::test]
+#[traced_test]
 async fn test_export_chunk() -> TestResult {
-    tracing_subscriber::fmt::try_init().ok();
     let testdir = tempfile::tempdir()?;
     let db_path = testdir.path().join("db");
     let store = crate::store::fs::FsStore::load(&db_path).await?;
@@ -849,8 +928,8 @@ async fn test_export_ranges(
 }
 
 #[tokio::test]
+#[traced_test]
 async fn export_ranges_smoke_fs() -> TestResult {
-    tracing_subscriber::fmt::try_init().ok();
     let testdir = tempfile::tempdir()?;
     let db_path = testdir.path().join("db");
     let store = crate::store::fs::FsStore::load(&db_path).await?;
@@ -858,8 +937,8 @@ async fn export_ranges_smoke_fs() -> TestResult {
 }
 
 #[tokio::test]
+#[traced_test]
 async fn export_ranges_smoke_mem() -> TestResult {
-    tracing_subscriber::fmt::try_init().ok();
     let store = MemStore::new();
     export_ranges_smoke(&store).await
 }
@@ -878,4 +957,237 @@ async fn export_ranges_smoke(store: &Store) -> TestResult {
         test_export_ranges(store, hash, &data, size * 4..size * 5).await?;
     }
     Ok(())
+}
+
+/// A source stream that yields an error must make `add_stream` fail with
+/// that error, not hang or import the truncated prefix.
+async fn check_add_stream_source_error(store: &Store) -> TestResult<()> {
+    let items: Vec<io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"first chunk of data")),
+        Err(io::Error::other("source stream failed")),
+    ];
+    let stream = n0_future::stream::iter(items);
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        store.blobs().add_stream(stream).await.temp_tag(),
+    )
+    .await?;
+    let err = res.expect_err("add_stream must fail when the source fails");
+    assert!(
+        format!("{err:?}").contains("source stream failed"),
+        "unexpected error: {err:?}"
+    );
+    // the store is still usable afterwards
+    let _tt = store.add_bytes(b"after".to_vec()).temp_tag().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[traced_test]
+async fn mem_add_stream_source_error() -> TestResult<()> {
+    let store = MemStore::new();
+    check_add_stream_source_error(&store).await
+}
+
+#[tokio::test]
+#[traced_test]
+async fn fs_add_stream_source_error() -> TestResult<()> {
+    let testdir = tempfile::tempdir()?;
+    let store = FsStore::load(testdir.path().join("db")).await?;
+    check_add_stream_source_error(&store).await?;
+    store.shutdown().await?;
+    Ok(())
+}
+
+/// `add_stream` takes a stream that is `Send` but not `Sync`.
+#[tokio::test]
+#[traced_test]
+async fn mem_add_stream_not_sync() -> TestResult<()> {
+    let store = MemStore::new();
+    let items = std::cell::Cell::new(0);
+    let stream = n0_future::stream::iter([Ok(Bytes::from_static(b"not sync"))]).map(move |item| {
+        items.set(items.get() + 1);
+        item
+    });
+    let tt = store.blobs().add_stream(stream).await.temp_tag().await?;
+    assert_eq!(tt.hash(), Hash::new(b"not sync"));
+    Ok(())
+}
+
+/// A store that shuts down in the middle of an export_ranges must not make
+/// the export look complete.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn mem_export_ranges_shutdown_mid_export() -> TestResult<()> {
+    const TOTAL: u64 = 8 << 20;
+    let data = (0..TOTAL).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+
+    // the stream ends with an error, unless all the data made it out
+    let store = MemStore::new();
+    let tt = store.add_slice(&data).temp_tag().await?;
+    let mut stream = store.export_ranges(tt.hash(), 0..TOTAL).stream();
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+        if items.len() == 3 {
+            store.shutdown().await?;
+        }
+    }
+    let received = items
+        .iter()
+        .map(|item| match item {
+            crate::api::proto::ExportRangesItem::Data(leaf) => leaf.data.len() as u64,
+            _ => 0,
+        })
+        .sum::<u64>();
+    let ends_with_error = matches!(
+        items.last(),
+        Some(crate::api::proto::ExportRangesItem::Error(_))
+    );
+    assert!(
+        ends_with_error || received == TOTAL,
+        "stream ended without error after {received} of {TOTAL} bytes"
+    );
+
+    // concatenate returns an error, unless it got all the data
+    let store = MemStore::new();
+    let tt = store.add_slice(&data).temp_tag().await?;
+    let blobs = store.blobs().clone();
+    let hash = tt.hash();
+    let task = tokio::spawn(async move { blobs.export_ranges(hash, 0..TOTAL).concatenate().await });
+    tokio::task::yield_now().await;
+    store.shutdown().await?;
+    if let Ok(res) = task.await? {
+        assert_eq!(
+            res.len() as u64,
+            TOTAL,
+            "concatenate returned truncated data"
+        );
+    }
+    Ok(())
+}
+
+/// A store that shuts down in the middle of an export_bao must not make the
+/// export look complete.
+#[tokio::test(flavor = "multi_thread")]
+#[traced_test]
+async fn mem_export_bao_shutdown_mid_export() -> TestResult<()> {
+    use bao_tree::io::mixed::EncodedItem;
+    const TOTAL: u64 = 8 << 20;
+    let data = (0..TOTAL).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let request = |hash| crate::api::proto::ExportBaoRequest {
+        hash,
+        ranges: ChunkRanges::all(),
+    };
+
+    // the stream ends with an error, unless all the data made it out
+    let store = MemStore::new();
+    let tt = store.add_slice(&data).temp_tag().await?;
+    let mut stream = store.export_bao_with_opts(request(tt.hash()), 1).stream();
+    let mut items = Vec::new();
+    while let Some(item) = stream.next().await {
+        items.push(item);
+        if items.len() == 3 {
+            store.shutdown().await?;
+        }
+    }
+    let received = items
+        .iter()
+        .map(|item| match item {
+            EncodedItem::Leaf(leaf) => leaf.data.len() as u64,
+            _ => 0,
+        })
+        .sum::<u64>();
+    let ends_with_error = matches!(items.last(), Some(EncodedItem::Error(_)));
+    assert!(
+        ends_with_error || received == TOTAL,
+        "stream ended without error after {received} of {TOTAL} bytes"
+    );
+
+    // data_to_vec returns an error, unless it got all the data
+    let store = MemStore::new();
+    let tt = store.add_slice(&data).temp_tag().await?;
+    let blobs = store.blobs().clone();
+    let hash = tt.hash();
+    let task = tokio::spawn(async move {
+        blobs
+            .export_bao_with_opts(request(hash), 1)
+            .data_to_vec()
+            .await
+    });
+    tokio::task::yield_now().await;
+    store.shutdown().await?;
+    if let Ok(res) = task.await? {
+        assert_eq!(
+            res.len() as u64,
+            TOTAL,
+            "data_to_vec returned truncated data"
+        );
+    }
+    Ok(())
+}
+
+/// A provider that has an entry for a blob but no data for it, not even the
+/// size, must answer like for a blob it has never seen, not with data that
+/// fails verification.
+async fn two_nodes_get_dataless_entry(
+    r1: Router,
+    store1: &Store,
+    r2: Router,
+    store2: &Store,
+) -> TestResult<()> {
+    let dataless = Hash::new(b"dataless");
+    let unknown = Hash::new(b"unknown");
+    // asking what is missing leaves an entry without data in the mem store
+    store1.remote().local(HashAndFormat::raw(dataless)).await?;
+    let res = store1
+        .export_bao(dataless, ChunkRanges::all())
+        .bao_to_vec()
+        .await;
+    assert!(
+        matches!(
+            &res,
+            Err(RequestError::Inner {
+                source: crate::api::Error::Io(cause),
+                ..
+            }) if cause.kind() == io::ErrorKind::NotFound
+        ),
+        "local export: {res:?}"
+    );
+    let conn = r2
+        .endpoint()
+        .connect(r1.endpoint().addr(), crate::ALPN)
+        .await?;
+    let get = |hash| {
+        store2.remote().execute_get(
+            conn.clone(),
+            crate::protocol::GetRequest::from(HashAndFormat::raw(hash)),
+        )
+    };
+    let Err(dataless_err) = get(dataless).await else {
+        panic!("get of a dataless entry succeeded");
+    };
+    let Err(unknown_err) = get(unknown).await else {
+        panic!("get of an unknown hash succeeded");
+    };
+    assert!(unknown_err.iroh_error_code().is_some());
+    assert_eq!(
+        dataless_err.iroh_error_code(),
+        unknown_err.iroh_error_code(),
+        "dataless: {dataless_err:?}, unknown: {unknown_err:?}"
+    );
+    tokio::try_join!(r1.shutdown(), r2.shutdown())?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn two_nodes_get_dataless_entry_mem() -> TestResult<()> {
+    let ((r1, store1), (r2, store2)) = two_node_test_setup_mem().await?;
+    two_nodes_get_dataless_entry(r1, &store1, r2, &store2).await
+}
+
+#[tokio::test]
+async fn two_nodes_get_dataless_entry_fs() -> TestResult<()> {
+    let (_testdir, (r1, store1, _), (r2, store2, _)) = two_node_test_setup_fs().await?;
+    two_nodes_get_dataless_entry(r1, &store1, r2, &store2).await
 }

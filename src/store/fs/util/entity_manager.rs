@@ -996,6 +996,24 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn idle_waits_for_persistence_after_receiver_handback() {
+            let (mut manager, mut tasks, mut entered, gate) = fixture(false);
+            parked(&mut manager, &mut tasks, &mut entered).await;
+            // Handback has been consumed, but persistence has not completed.
+            // FsActor must not report idle merely because ingress is empty.
+            assert!(manager.has_pending_lifecycle());
+            gate.add_permits(1);
+            assert!(timeout(Duration::from_secs(5), manager.tick())
+                .await
+                .unwrap()
+                .is_none());
+            assert!(!manager.has_pending_lifecycle());
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        }
+
+        #[tokio::test]
         async fn full_parked_inbox_waits_and_legacy_busy_is_preserved() {
             let (mut manager, mut tasks, mut entered, gate) = fixture(false);
             parked(&mut manager, &mut tasks, &mut entered).await;

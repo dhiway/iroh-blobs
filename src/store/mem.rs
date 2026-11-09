@@ -7,6 +7,9 @@
 //!
 //! For many use cases this can be quite useful, since it does not require write access
 //! to the file system.
+#[cfg(any(wasm_browser, test))]
+mod import_outboard;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     future::Future,
@@ -121,6 +124,7 @@ impl MemStore {
 
     pub fn new_with_opts(opts: Options) -> Self {
         let (sender, receiver) = tokio::sync::mpsc::channel(32);
+        let gc_sender = sender.downgrade();
         n0_future::task::spawn(
             Actor {
                 commands: receiver,
@@ -140,7 +144,7 @@ impl MemStore {
 
         let store = Self::from_sender(sender.into());
         if let Some(gc_config) = opts.gc_config {
-            n0_future::task::spawn(run_gc(store.deref().clone(), gc_config));
+            n0_future::task::spawn(run_gc(gc_sender, gc_config));
         }
 
         store
@@ -179,6 +183,8 @@ impl Actor {
                 tx,
                 ..
             }) => {
+                // protect from a gc run that is already past the mark phase, like the fs store
+                self.protected.insert(hash);
                 let entry = self.get_or_create_entry(hash);
                 self.spawn(import_bao(entry, size, data, tx));
             }
@@ -455,6 +461,8 @@ impl Actor {
             }
         };
         let hash = import_data.outboard.root().into();
+        // protect from a gc run that is already past the mark phase, like the fs store
+        self.protected.insert(hash);
         let entry = self.get_or_create_entry(hash);
         entry
             .0
@@ -580,6 +588,7 @@ async fn export_ranges_impl(
     debug_assert!(entry.hash() == hash, "hash mismatch");
     let data = entry.data_reader();
     let size = bitfield.size();
+    tx.send(ExportRangesItem::Size(size)).await?;
     for range in ranges.iter() {
         let range = match range {
             RangeSetRange::Range(range) => size.min(*range.start)..size.min(*range.end),
@@ -587,9 +596,10 @@ async fn export_ranges_impl(
         };
         let requested = ChunkRanges::bytes(range.start..range.end);
         if !bitfield.ranges.is_superset(&requested) {
-            return Err(io::Error::other(format!(
-                "missing range: {requested:?}, present: {bitfield:?}",
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("missing range: {requested:?}, present: {bitfield:?}"),
+            ));
         }
         let bs = 1024;
         let mut offset = range.start;
@@ -686,10 +696,16 @@ async fn export_bao(
     ranges: ChunkRanges,
     mut sender: mpsc::Sender<EncodedItem>,
 ) {
-    let Some(entry) = entry else {
-        let err = EncodeError::Io(io::Error::new(io::ErrorKind::NotFound, "hash not found"));
-        sender.send(err.into()).await.ok();
-        return;
+    let entry = match entry {
+        // an entry without any data, not even the size, is answered like a missing one
+        Some(entry) if entry.hash == Hash::EMPTY || entry.outboard_reader().tree.size() != 0 => {
+            entry
+        }
+        _ => {
+            let err = EncodeError::Io(io::Error::new(io::ErrorKind::NotFound, "hash not found"));
+            sender.send(err.into()).await.ok();
+            return;
+        }
     };
     tracing::Span::current().record("hash", tracing::field::display(entry.hash));
     let data = entry.data_reader();
@@ -713,7 +729,10 @@ async fn import_bytes(
 ) -> Result<ImportEntry> {
     tx.send(AddProgressItem::Size(data.len() as u64)).await?;
     tx.send(AddProgressItem::CopyDone).await?;
+    #[cfg(not(wasm_browser))]
     let outboard = PreOrderMemOutboard::create(&data, IROH_BLOCK_SIZE);
+    #[cfg(wasm_browser)]
+    let outboard = import_outboard::create(data.clone()).await?;
     Ok(ImportEntry {
         data,
         outboard,
