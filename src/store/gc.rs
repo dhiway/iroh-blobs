@@ -466,7 +466,7 @@ mod tests {
         let mut stream = gc_sweep(store, &live);
         while let Some(ev) = stream.next().await {
             if let GcSweepEvent::Error(err) = ev {
-                return Err(err.into());
+                panic!("gc sweep failed: {err}");
             }
         }
         assert!(store.has(ah).await?, "complete import was swept");
@@ -536,7 +536,7 @@ mod tests {
                 drop(tt);
             })
         });
-        gc_run_once(&proxy, &mut HashSet::new()).await?;
+        gc_run_once(&proxy, &mut HashSet::new(), None).await?;
         assert!(store.has(hash).await?, "the handed over blob was swept");
         Ok(())
     }

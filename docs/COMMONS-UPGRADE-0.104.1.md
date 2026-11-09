@@ -22,7 +22,10 @@ second narrower accessor: it accounts for persistence completions as well as
 receiver handbacks. A new gated persistence test covers this interaction.
 Preserve upstream's internal-ingress polling order while keeping external-close
 drain. Adapt the retained GC regression to upstream's new optional protect
-callback argument (`None` for the unprotected test).
+callback argument (`None` for the unprotected test). Adapt the retained actor
+fixture to upstream's current-runtime constructor. Repair the upstream GC
+handover test's omitted callback argument and report sweep failure with a test
+panic directly, avoiding the diverging TestError conversion under strict lint.
 
 Keep upstream's actual import cleanup, poisoned-entry, GC protection, shutdown,
 range decoding and error-propagation fixes as implemented. Do not recreate them

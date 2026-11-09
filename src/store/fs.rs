@@ -2292,15 +2292,10 @@ pub mod tests {
         tokio::sync::mpsc::Sender<Command>,
         tokio::sync::mpsc::Sender<InternalCommand>,
     )> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_time()
-            .build()?;
         let (commands, receive) = tokio::sync::mpsc::channel(1);
         let (internal, internal_receive) = tokio::sync::mpsc::channel(1);
         let mut actor = Actor::new(
             path.join("blobs.db"),
-            runtime.into(),
             receive,
             internal_receive,
             internal.clone(),
