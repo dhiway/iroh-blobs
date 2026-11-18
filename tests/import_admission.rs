@@ -108,6 +108,7 @@ async fn twenty_thousand_equal_batch_imports_and_scope_release() -> TestResult {
             .tags()
             .list_temp_tags()
             .await?
+            .map(|item| item.unwrap())
             .collect::<Vec<_>>()
             .await;
         assert!(tags.iter().any(|value| value.hash == expected));
@@ -118,6 +119,7 @@ async fn twenty_thousand_equal_batch_imports_and_scope_release() -> TestResult {
             .tags()
             .list_temp_tags()
             .await?
+            .map(|item| item.unwrap())
             .collect::<Vec<_>>()
             .await;
         assert!(!tags.iter().any(|value| value.hash == expected));

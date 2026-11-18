@@ -11,7 +11,7 @@ use std::{
 use bao_tree::BaoTree;
 use bytes::Bytes;
 use irpc::channel::mpsc;
-use n0_error::{anyerr, e, stack_error, AnyError};
+use n0_error::{anyerr, e, stack_error, AnyError, StdResultExt};
 use redb::{Database, DatabaseError, ReadableDatabase, ReadableTable};
 use tokio::pin;
 
@@ -21,8 +21,9 @@ use crate::{
         blobs::BlobStatus,
         proto::{
             BlobDeleteRequest, BlobStatusMsg, BlobStatusRequest, ClearProtectedMsg,
-            CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsMsg, ListRequest,
-            ListTagsRequest, RenameTagRequest, SetTagRequest, ShutdownMsg, SyncDbMsg,
+            CreateTagRequest, DeleteBlobsMsg, DeleteTagsRequest, ListBlobsItem, ListBlobsMsg,
+            ListRequest, ListTagsItem, ListTagsMsg, ListTagsRequest, RenameTagRequest,
+            SetTagRequest, ShutdownMsg, SyncDbMsg,
         },
         tags::TagInfo,
         Tag,
@@ -31,12 +32,16 @@ use crate::{
     Hash,
 };
 mod proto;
+mod recovery;
+mod run;
 pub use proto::*;
 pub(crate) mod tables;
-use tables::{ReadOnlyTables, ReadableTables, Tables};
-use tracing::{debug, error, info_span, trace, Span};
+use run::{LastShutdown, Run};
+use tables::{ReadOnlyTables, ReadableTables, Tables, META_TABLE};
+use tracing::{debug, error, info, info_span, trace, warn, Span};
 
 use super::{
+    boot_id,
     delete_set::DeleteHandle,
     entry_state::{DataLocation, EntryState, OutboardLocation},
     options::BatchOptions,
@@ -330,43 +335,46 @@ async fn handle_get_blob_status(
     Ok(())
 }
 
-async fn handle_list_tags(msg: ListTagsMsg, tables: &impl ReadableTables) -> ActorResult<()> {
-    trace!("{msg:?}");
-    let ListTagsMsg {
-        inner:
-            ListTagsRequest {
-                from,
-                to,
-                raw,
-                hash_seq,
-            },
-        tx,
-        ..
-    } = msg;
+/// Streams a snapshot without making the metadata actor wait for the reader.
+pub async fn list_tags(snapshot: ReadOnlyTables, cmd: ListTagsMsg) {
+    let ListTagsMsg { mut tx, inner, .. } = cmd;
+    if let Err(cause) = list_tags_impl(snapshot, inner, &mut tx).await {
+        tx.send(ListTagsItem::Error(cause)).await.ok();
+    }
+}
+
+async fn list_tags_impl(
+    snapshot: ReadOnlyTables,
+    request: ListTagsRequest,
+    tx: &mut mpsc::Sender<ListTagsItem>,
+) -> api::Result<()> {
+    let ListTagsRequest {
+        from,
+        to,
+        raw,
+        hash_seq,
+    } = request;
     let from = from.map(Bound::Included).unwrap_or(Bound::Unbounded);
     let to = to.map(Bound::Excluded).unwrap_or(Bound::Unbounded);
-    let mut res = Vec::new();
-    for item in tables
+    for item in snapshot
         .tags()
         .range((from, to))
-        .map_err(|e| e!(ActorError::Storage, e))?
+        .map_err(api_error_from_storage_error)?
     {
-        match item {
-            Ok((k, v)) => {
-                let v = v.value();
-                if raw && v.format.is_raw() || hash_seq && v.format.is_hash_seq() {
-                    let info = TagInfo {
-                        name: k.value(),
-                        hash: v.hash,
-                        format: v.format,
-                    };
-                    res.push(crate::api::Result::Ok(info));
-                }
+        let (k, v) = item.map_err(api_error_from_storage_error)?;
+        let v = v.value();
+        if raw && v.format.is_raw() || hash_seq && v.format.is_hash_seq() {
+            let info = TagInfo {
+                name: k.value(),
+                hash: v.hash,
+                format: v.format,
+            };
+            if tx.send(ListTagsItem::Tag(info)).await.is_err() {
+                return Ok(());
             }
-            Err(e) => res.push(Err(api_error_from_storage_error(e))),
         }
     }
-    tx.send(res).await.ok();
+    tx.send(ListTagsItem::Done).await.ok();
     Ok(())
 }
 
@@ -537,6 +545,7 @@ impl Actor {
         cmds: tokio::sync::mpsc::Receiver<Command>,
         mut ds: DeleteHandle,
         options: BatchOptions,
+        syncs_files: bool,
     ) -> Result<Self, ActorError> {
         debug!("creating or opening meta database at {}", db_path.display());
         let db = match redb::Database::create(db_path) {
@@ -550,9 +559,44 @@ impl Actor {
             }
             Err(err) => return Err(err.into()),
         };
+        let paths = ds.paths().clone();
         let tx = db.begin_write()?;
         let ftx = ds.begin_write();
-        Tables::new(&tx, &ftx)?;
+        let mut tables = Tables::new(&tx, &ftx)?;
+        let mut meta = tx.open_table(META_TABLE)?;
+        let run = Run {
+            boot_id: boot_id::current(),
+            syncs_files,
+        };
+        // Recovery commits together with the new run, so if the process dies
+        // during it, the next open still finds the old one.
+        match run::record(&mut meta, &run)? {
+            LastShutdown::Clean => {}
+            LastShutdown::ProcessCrash => info!(
+                "the blob store was not shut down cleanly, but the machine kept running, so \
+                 nothing that was written got lost"
+            ),
+            LastShutdown::MaybeOsCrash { synced: true, .. } => info!(
+                "the blob store was not shut down cleanly, but its last run synced its files, \
+                 so an OS crash cannot have damaged entries"
+            ),
+            LastShutdown::MaybeOsCrash { synced: false } => {
+                warn!(
+                    "the blob store was not shut down cleanly, and the machine may have gone \
+                     down too, so entries are checked again in case an OS crash lost data"
+                );
+                report(&recovery::recover(&mut tables, &paths)?);
+            }
+        }
+        // A PowerLoss run must also cover writes inherited from earlier runs.
+        // Sync after recovery so its writes and bitfield deletions are included,
+        // and before committing the new run so a failed sync leaves the old one.
+        if syncs_files {
+            super::sync_fs::sync(&paths.data_path)
+                .std_context("syncing the data filesystem on open")?;
+        }
+        drop(meta);
+        drop(tables);
         tx.commit()?;
         drop(ftx);
         let cmds = PeekableReceiver::new(cmds);
@@ -572,7 +616,7 @@ impl Actor {
         op: TxnNum,
     ) -> ActorResult<()> {
         let span = info_span!(
-            parent: &cmd.parent_span(),
+            parent: cmd.parent_span(),
             "tx",
             op = tracing::field::debug(op),
         );
@@ -580,7 +624,6 @@ impl Actor {
         match cmd {
             ReadOnlyCommand::Get(cmd) => handle_get(cmd, tables),
             ReadOnlyCommand::Dump(cmd) => handle_dump(cmd, tables),
-            ReadOnlyCommand::ListTags(cmd) => handle_list_tags(cmd, tables).await,
             ReadOnlyCommand::ClearProtected(cmd) => handle_clear_protected(cmd, protected).await,
             ReadOnlyCommand::GetBlobStatus(cmd) => handle_get_blob_status(cmd, tables).await,
         }
@@ -732,7 +775,7 @@ impl Actor {
         op: TxnNum,
     ) -> ActorResult<()> {
         let span = info_span!(
-            parent: &cmd.parent_span(),
+            parent: cmd.parent_span(),
             "tx",
             op = tracing::field::debug(op),
         );
@@ -745,9 +788,6 @@ impl Actor {
             ReadWriteCommand::CreateTag(cmd) => Self::create_tag(tables, cmd).await,
             ReadWriteCommand::DeleteTags(cmd) => Self::delete_tags(tables, cmd).await,
             ReadWriteCommand::RenameTag(cmd) => Self::rename_tag(tables, cmd).await,
-            ReadWriteCommand::ProcessExit(cmd) => {
-                std::process::exit(cmd.code);
-            }
         }
     }
 
@@ -781,7 +821,7 @@ impl Actor {
         op: TxnNum,
     ) -> ActorResult<Option<ShutdownMsg>> {
         let span = info_span!(
-            parent: &cmd.parent_span(),
+            parent: cmd.parent_span(),
             "tx",
             op = tracing::field::debug(op),
         );
@@ -793,7 +833,7 @@ impl Actor {
             }
             TopLevelCommand::Shutdown(cmd) => {
                 trace!("{cmd:?}");
-                // nothing to do here, since the database will be dropped
+                Self::clear_run(db)?;
                 Some(cmd)
             }
             TopLevelCommand::Snapshot(cmd) => {
@@ -806,6 +846,20 @@ impl Actor {
                 None
             }
         })
+    }
+
+    /// Removes the run record, so the next open knows the store was shut down cleanly.
+    fn clear_run(db: &Database) -> ActorResult<()> {
+        let tx = db
+            .begin_write()
+            .map_err(|e| e!(ActorError::Transaction, e))?;
+        let mut meta = tx
+            .open_table(META_TABLE)
+            .map_err(|e| e!(ActorError::Table, e))?;
+        run::clear(&mut meta).map_err(|e| e!(ActorError::Storage, e))?;
+        drop(meta);
+        tx.commit().map_err(|e| e!(ActorError::Commit, e))?;
+        Ok(())
     }
 
     pub async fn run(self) {
@@ -885,6 +939,32 @@ impl Actor {
             shutdown.tx.send(()).await.ok();
         }
         Ok(())
+    }
+}
+
+/// Logs what recovery did.
+fn report(recovered: &recovery::Recovered) {
+    info!(
+        "{} complete and {} partial entries are checked against their files when next loaded",
+        recovered.complete, recovered.partial
+    );
+    if recovered.external > 0 {
+        warn!(
+            "{} entries with external data have no owned outboard to recover",
+            recovered.external
+        );
+    }
+    if recovered.external_verified > 0 {
+        info!(
+            "{} entries with external data have a verified reference and owned outboard",
+            recovered.external_verified
+        );
+    }
+    if recovered.external_unavailable > 0 {
+        warn!(
+            "{} entries with external data became partial; re-import a valid source to restore the reference",
+            recovered.external_unavailable
+        );
     }
 }
 
@@ -982,19 +1062,16 @@ pub(crate) fn raw_outboard_size(size: u64) -> u64 {
 
 pub async fn list_blobs(snapshot: ReadOnlyTables, cmd: ListBlobsMsg) {
     let ListBlobsMsg { mut tx, inner, .. } = cmd;
-    match list_blobs_impl(snapshot, inner, &mut tx).await {
-        Ok(()) => {}
-        Err(e) => {
-            error!("error listing blobs: {}", e);
-            tx.send(Err(e)).await.ok();
-        }
+    if let Err(cause) = list_blobs_impl(snapshot, inner, &mut tx).await {
+        error!("error listing blobs: {}", cause);
+        tx.send(ListBlobsItem::Error(cause)).await.ok();
     }
 }
 
 async fn list_blobs_impl(
     snapshot: ReadOnlyTables,
     _cmd: ListRequest,
-    tx: &mut mpsc::Sender<api::Result<Hash>>,
+    tx: &mut mpsc::Sender<ListBlobsItem>,
 ) -> api::Result<()> {
     for item in snapshot
         .blobs
@@ -1002,9 +1079,11 @@ async fn list_blobs_impl(
         .map_err(api_error_from_storage_error)?
     {
         let (k, _) = item.map_err(api_error_from_storage_error)?;
-        let k = k.value();
-        tx.send(Ok(k)).await.ok();
+        if tx.send(ListBlobsItem::Hash(k.value())).await.is_err() {
+            return Ok(());
+        }
     }
+    tx.send(ListBlobsItem::Done).await.ok();
     Ok(())
 }
 
@@ -1013,9 +1092,314 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        super::{delete_set, options::PathOptions},
+        super::{
+            delete_set,
+            options::{CrashConsistency, Options, PathOptions},
+        },
         *,
     };
+
+    fn a_run(boot_id: Option<&str>, syncs_files: bool) -> Run {
+        Run {
+            boot_id: boot_id.map(str::to_owned),
+            syncs_files,
+        }
+    }
+
+    /// Reads the recorded run from a closed store's database.
+    fn recorded_run(db: &std::path::Path) -> testresult::TestResult<Option<Run>> {
+        let db = Database::open(db)?;
+        let tx = db.begin_read()?;
+        Ok(run::read(&tx.open_table(META_TABLE)?))
+    }
+
+    /// Records `run` as the open run of a closed store's database.
+    fn set_run(db: &std::path::Path, run: &Run) -> testresult::TestResult<()> {
+        let db = Database::open(db)?;
+        let tx = db.begin_write()?;
+        run::write(&mut tx.open_table(META_TABLE)?, run)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn opening_records_the_run_until_a_clean_shutdown() -> testresult::TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = Arc::new(PathOptions::new(dir.path()));
+        let db = dir.path().join("db");
+        let (_protect, deletes) = delete_set::pair(paths);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        // dropped without a shutdown, as in a crash
+        drop(Actor::new(
+            db.clone(),
+            rx,
+            deletes,
+            BatchOptions::default(),
+            false,
+        )?);
+        let expected = Run {
+            boot_id: boot_id::current(),
+            syncs_files: false,
+        };
+        assert_eq!(recorded_run(&db)?, Some(expected));
+        Ok(())
+    }
+
+    /// Opens a store at `dir` with `crash_consistency`.
+    async fn open(
+        dir: &std::path::Path,
+        crash_consistency: CrashConsistency,
+    ) -> n0_error::Result<crate::store::fs::FsStore> {
+        let mut options = Options::new(dir);
+        options.crash_consistency = crash_consistency;
+        crate::store::fs::FsStore::load_with_opts(dir.join("blobs.db"), options).await
+    }
+
+    /// Simulates an OS crash during an unsynced run, and checks entries after reopening with `reopen`.
+    async fn os_crash_recovery(reopen: CrashConsistency) -> testresult::TestResult<()> {
+        use bao_tree::ChunkRanges;
+
+        use crate::api::blobs::BlobStatus;
+
+        let dir = tempfile::tempdir()?;
+        let paths = PathOptions::new(dir.path());
+        let data = |byte: u8, len: usize| (0..len).map(|i| byte ^ (i as u8)).collect::<Vec<_>>();
+        // owned data, inline outboard
+        let intact = data(1, 100_000);
+        let truncated = data(2, 100_000);
+        // owned data and outboard
+        let no_outboard = data(3, 5_000_000);
+        let store = open(dir.path(), CrashConsistency::ProcessCrash).await?;
+        let intact_hash = store.add_bytes(intact.clone()).await?.hash;
+        let truncated_hash = store.add_bytes(truncated).await?.hash;
+        let no_outboard_hash = store.add_bytes(no_outboard).await?.hash;
+        store.shutdown().await?;
+        drop(store);
+
+        // the machine went down while the store was open, and lost writes
+        set_run(
+            &dir.path().join("blobs.db"),
+            &a_run(Some("another boot"), false),
+        )?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(paths.data_path(&truncated_hash))?;
+        file.set_len(50_000)?;
+        std::fs::File::create(paths.outboard_path(&no_outboard_hash))?;
+
+        let store = open(dir.path(), reopen).await?;
+        // loading an entry checks it, an intact one is complete again
+        assert_eq!(
+            store.get_bytes(intact_hash).await?.as_ref(),
+            intact.as_slice()
+        );
+        assert!(matches!(
+            store.status(intact_hash).await?,
+            BlobStatus::Complete { size: 100_000 }
+        ));
+        // a damaged one keeps what its files still hold, and nothing more
+        let bitfield = store.observe(truncated_hash).await?;
+        assert!(!bitfield.is_complete());
+        assert!(bitfield.ranges.contains(&bao_tree::ChunkNum(0)));
+        assert!(store.get_bytes(truncated_hash).await.is_err());
+        let bitfield = store.observe(no_outboard_hash).await?;
+        assert_eq!(bitfield.ranges, ChunkRanges::empty());
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_an_os_crash_entries_only_claim_what_their_files_hold(
+    ) -> testresult::TestResult<()> {
+        os_crash_recovery(CrashConsistency::ProcessCrash).await
+    }
+
+    #[tokio::test]
+    async fn recovery_depends_on_the_last_run_not_this_one() -> testresult::TestResult<()> {
+        os_crash_recovery(CrashConsistency::PowerLoss).await
+    }
+
+    async fn reference_file(
+        store: &crate::store::fs::FsStore,
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> testresult::TestResult<Hash> {
+        use crate::{
+            api::blobs::{AddPathOptions, ImportMode},
+            BlobFormat,
+        };
+
+        std::fs::write(path, bytes)?;
+        Ok(store
+            .add_path_with_opts(AddPathOptions {
+                path: path.to_owned(),
+                format: BlobFormat::Raw,
+                mode: ImportMode::TryReference,
+            })
+            .await?
+            .hash)
+    }
+
+    #[tokio::test]
+    async fn os_crash_repairs_missing_truncated_or_corrupt_external_outboard(
+    ) -> testresult::TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("store");
+        let paths = PathOptions::new(&root);
+        let store = open(&root, CrashConsistency::ProcessCrash).await?;
+        let mut entries = Vec::new();
+        for byte in 1..=4 {
+            let source = dir.path().join(format!("caller-{byte}"));
+            let data = vec![byte; 5_000_013];
+            let hash = reference_file(&store, &source, &data).await?;
+            assert!(!paths.data_path(&hash).exists());
+            let outboard = paths.outboard_path(&hash);
+            let proof = std::fs::read(&outboard)?;
+            assert!(proof.len() > 16 * 1024);
+            entries.push((hash, source, outboard, data, proof));
+        }
+        store.shutdown().await?;
+        drop(store);
+        set_run(&root.join("blobs.db"), &a_run(Some("another boot"), false))?;
+        std::fs::remove_file(&entries[0].2)?;
+        std::fs::write(&entries[1].2, &entries[1].4[..64])?;
+        let mut corrupt = entries[2].4.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(&entries[2].2, corrupt)?;
+
+        let store = open(&root, CrashConsistency::ProcessCrash).await?;
+        for (hash, source, outboard, data, proof) in entries {
+            assert_eq!(std::fs::read(outboard)?, proof);
+            assert_eq!(std::fs::read(source)?, data);
+            assert_eq!(store.get_bytes(hash).await?.as_ref(), data.as_slice());
+            assert!(store.observe(hash).await?.is_complete());
+            assert!(!paths.data_path(&hash).exists());
+        }
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn os_crash_uses_verified_external_alias_or_reports_partial() -> testresult::TestResult<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("store");
+        let paths = PathOptions::new(&root);
+        let store = open(&root, CrashConsistency::ProcessCrash).await?;
+        let data = vec![1; 5_000_013];
+        let invalid = vec![2; data.len()];
+        let first = dir.path().join("a");
+        let second = dir.path().join("b");
+        let with_alias = reference_file(&store, &first, &data).await?;
+        assert_eq!(reference_file(&store, &second, &data).await?, with_alias);
+        let missing = dir.path().join("missing");
+        let missing_hash = reference_file(&store, &missing, &invalid).await?;
+        let modified = dir.path().join("modified");
+        let modified_hash = reference_file(&store, &modified, &vec![3; data.len()]).await?;
+        let unrelated = store.add_bytes("survived").await?.hash;
+        store.shutdown().await?;
+        drop(store);
+        set_run(&root.join("blobs.db"), &a_run(Some("another boot"), false))?;
+        std::fs::write(&first, &invalid)?;
+        std::fs::write(&modified, &invalid)?;
+        std::fs::remove_file(&missing)?;
+        for hash in [with_alias, missing_hash, modified_hash] {
+            std::fs::remove_file(paths.outboard_path(&hash))?;
+        }
+
+        let store = open(&root, CrashConsistency::ProcessCrash).await?;
+        assert_eq!(store.get_bytes(with_alias).await?.as_ref(), data.as_slice());
+        assert_eq!(store.get_bytes(unrelated).await?.as_ref(), b"survived");
+        for hash in [missing_hash, modified_hash] {
+            assert!(matches!(
+                store.status(hash).await?,
+                BlobStatus::Partial { .. }
+            ));
+            assert!(store.observe(hash).await?.ranges.is_empty());
+            assert!(store.get_bytes(hash).await.is_err());
+        }
+        assert_eq!(std::fs::read(&first)?, invalid);
+        assert_eq!(std::fs::read(&modified)?, invalid);
+        assert!(!missing.exists());
+
+        assert_eq!(
+            reference_file(&store, &missing, &invalid).await?,
+            missing_hash
+        );
+        assert_eq!(
+            store.get_bytes(missing_hash).await?.as_ref(),
+            invalid.as_slice()
+        );
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn os_crash_preserves_external_reference_after_io_failure() -> testresult::TestResult<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("store");
+        let paths = PathOptions::new(&root);
+        let store = open(&root, CrashConsistency::ProcessCrash).await?;
+        let source = dir.path().join("caller");
+        let data = vec![7; 5_000_013];
+        let hash = reference_file(&store, &source, &data).await?;
+        store.shutdown().await?;
+        drop(store);
+
+        let db = root.join("blobs.db");
+        let interrupted = a_run(Some("another boot"), false);
+        set_run(&db, &interrupted)?;
+        let saved = dir.path().join("saved");
+        std::fs::rename(&source, &saved)?;
+        std::os::unix::fs::symlink(&source, &source)?;
+        std::fs::remove_file(paths.outboard_path(&hash))?;
+        assert!(open(&root, CrashConsistency::ProcessCrash).await.is_err());
+        assert_eq!(recorded_run(&db)?, Some(interrupted));
+
+        std::fs::remove_file(&source)?;
+        std::fs::rename(&saved, &source)?;
+        let store = open(&root, CrashConsistency::ProcessCrash).await?;
+        assert_eq!(store.get_bytes(hash).await?.as_ref(), data.as_slice());
+        assert_eq!(std::fs::read(source)?, data);
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn after_an_os_crash_a_synced_run_needs_no_recovery() -> testresult::TestResult<()> {
+        use crate::api::blobs::BlobStatus;
+
+        let dir = tempfile::tempdir()?;
+        let data = vec![7u8; 100_000];
+        let store = open(dir.path(), CrashConsistency::PowerLoss).await?;
+        let hash = store.add_bytes(data).await?.hash;
+        store.shutdown().await?;
+        drop(store);
+        set_run(
+            &dir.path().join("blobs.db"),
+            &a_run(Some("another boot"), true),
+        )?;
+        let store = open(dir.path(), CrashConsistency::ProcessCrash).await?;
+        // recovery would have made it partial until it is loaded
+        assert!(matches!(
+            store.status(hash).await?,
+            BlobStatus::Complete { size: 100_000 }
+        ));
+        store.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_clean_shutdown_clears_the_run() -> testresult::TestResult<()> {
+        let dir = tempfile::tempdir()?;
+        let store = crate::store::fs::FsStore::load(dir.path()).await?;
+        store.shutdown().await?;
+        drop(store);
+        assert_eq!(recorded_run(&dir.path().join("blobs.db"))?, None);
+        Ok(())
+    }
 
     #[test]
     fn export_then_reimport_before_metadata_runs() -> testresult::TestResult<()> {

@@ -30,6 +30,12 @@ pub const INTERESTING_SIZES: [usize; 8] = [
 ];
 
 async fn blobs_smoke(path: &Path, blobs: &Blobs) -> TestResult<()> {
+    // Empty file exports also go through the store, including over RPC.
+    let target = path.join("empty-export");
+    std::fs::write(&target, b"replace me")?;
+    assert_eq!(blobs.export(Hash::EMPTY, &target).await?, 0);
+    assert_eq!(std::fs::read(target)?, b"");
+
     // test importing and exporting bytes
     {
         let expected = b"hello".to_vec();
@@ -76,8 +82,10 @@ async fn blobs_smoke(path: &Path, blobs: &Blobs) -> TestResult<()> {
     }
 
     {
+        // the 3 blobs added above, and the empty blob, which is always present
         let hashes = blobs.list().hashes().await?;
-        assert_eq!(hashes.len(), 3);
+        assert_eq!(hashes.len(), 4);
+        assert!(hashes.contains(&Hash::EMPTY));
     }
     Ok(())
 }
@@ -106,8 +114,8 @@ async fn blobs_smoke_mem() -> TestResult {
 #[traced_test]
 async fn blobs_smoke_fs_rpc() -> TestResult {
     let unspecified = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
-    let (server, cert) = irpc::util::make_server_endpoint(unspecified)?;
-    let client = irpc::util::make_client_endpoint(unspecified, &[cert.as_ref()])?;
+    let (server, cert) = irpc::noq::make_server_endpoint(unspecified)?;
+    let client = irpc::noq::make_client_endpoint(unspecified, &[cert.as_ref()])?;
     let td = tempfile::tempdir()?;
     let store = FsStore::load(td.path().join("a")).await?;
     n0_future::task::spawn(store.deref().clone().listen(server.clone()));

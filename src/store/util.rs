@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, fmt};
+use std::{borrow::Borrow, fmt, io};
 
 use bao_tree::io::mixed::EncodedItem;
 use bytes::Bytes;
@@ -13,6 +13,8 @@ use serde::{Deserialize, Serialize};
 pub use sparse_mem_file::SparseMemFile;
 pub mod observer;
 mod size_info;
+#[cfg(feature = "fs-store")]
+pub(crate) use size_info::size_slot;
 pub use size_info::SizeInfo;
 mod partial_mem_storage;
 pub use partial_mem_storage::PartialMemStorage;
@@ -22,6 +24,38 @@ mod mem_or_file;
 #[cfg(feature = "fs-store")]
 #[cfg_attr(iroh_blobs_docsrs, doc(cfg(feature = "fs-store")))]
 pub use mem_or_file::{FixedSize, MemOrFile};
+
+/// Exports the empty blob on the store's filesystem without creating a blob entry.
+pub(crate) async fn export_empty(cmd: crate::api::proto::ExportPathMsg) {
+    use crate::api::proto::ExportProgressItem;
+
+    let result = (|| -> io::Result<()> {
+        let target = &cmd.target;
+        if !target.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not absolute",
+            ));
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::File::create(target)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            cmd.tx.send(ExportProgressItem::Size(0)).await.ok();
+            cmd.tx.send(ExportProgressItem::Done).await.ok();
+        }
+        Err(cause) => {
+            cmd.tx
+                .send(ExportProgressItem::Error(cause.into()))
+                .await
+                .ok();
+        }
+    }
+}
 
 /// A named, persistent tag.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, From, Into)]
@@ -230,13 +264,13 @@ mod fs {
         // Write all at once
         let mut file = File::create(&path)?;
         file.write_all(&buffer)?;
-        file.sync_all()?;
 
         Ok(())
     }
 
     pub fn read_checksummed_and_truncate<T: DeserializeOwned>(
         path: impl AsRef<Path>,
+        sync: bool,
     ) -> io::Result<T> {
         let path = path.as_ref();
         let mut file = OpenOptions::new()
@@ -246,8 +280,16 @@ mod fs {
             .open(path)?;
         let mut buffer = Vec::new();
         file.read_to_end(&mut buffer)?;
+        // The truncation marks the file dirty; a process crash sees it without a
+        // sync. For PowerLoss it is synced so that an old bitfield cannot come
+        // back after a power loss. That is probably harmless, since it only
+        // claims data that was synced when it was written, but only if the
+        // claimed outboard bytes cannot change, e.g. when an unvalidated size
+        // turns out wrong. Until that is checked, keep the sync.
         file.set_len(0)?;
-        file.sync_all()?;
+        if sync {
+            file.sync_all()?;
+        }
 
         if buffer.is_empty() {
             return Err(io::Error::new(

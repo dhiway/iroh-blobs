@@ -104,7 +104,7 @@ use entity_manager::{EntityManagerState, SpawnArg};
 use entry_state::{DataLocation, OutboardLocation};
 use import::{ImportEntry, ImportSource};
 use irpc::{channel::mpsc, RpcMessage};
-use meta::list_blobs;
+use meta::{list_blobs, list_tags};
 use n0_error::{Result, StdResultExt};
 use n0_future::{future::yield_now, io};
 use nested_enum_utils::enum_conversions;
@@ -125,10 +125,7 @@ use crate::{
     protocol::ChunkRangesExt,
     store::{
         fs::{
-            bao_file::{
-                BaoFileStorage, BaoFileStorageSubscriber, CompleteStorage, DataReader,
-                OutboardReader,
-            },
+            bao_file::{BaoFileStorage, BaoFileStorageSubscriber, DataReader, OutboardReader},
             util::entity_manager::{self, ActiveEntityState},
         },
         gc::run_gc,
@@ -143,11 +140,13 @@ use crate::{
 };
 mod bao_file;
 use bao_file::BaoFileHandle;
+mod boot_id;
 mod delete_set;
 mod entry_state;
 mod import;
 mod meta;
 pub mod options;
+mod sync_fs;
 pub(crate) mod util;
 use entry_state::EntryState;
 use import::{import_byte_stream, import_bytes, import_path, ImportEntryMsg};
@@ -198,10 +197,7 @@ impl InternalCommand {
         match self {
             Self::Dump(_) => tracing::Span::current(),
             Self::ClearScope(_) => tracing::Span::current(),
-            Self::FinishImport(cmd) => cmd
-                .parent_span_opt()
-                .cloned()
-                .unwrap_or_else(tracing::Span::current),
+            Self::FinishImport(cmd) => cmd.span.clone(),
         }
     }
 }
@@ -296,26 +292,19 @@ impl SyncEntityApi for HashContext {
         });
         match action {
             Action::Load => {
-                let state = if self.id == Hash::EMPTY {
-                    BaoFileStorage::Complete(CompleteStorage {
-                        data: MemOrFile::Mem(Bytes::new()),
-                        outboard: MemOrFile::empty(),
-                    })
-                } else {
-                    // we must assign a new state even in the error case, otherwise
-                    // tasks waiting for loading would stall!
-                    match self.global.db.get(self.id).await {
-                        Ok(state) => match BaoFileStorage::open(state, self).await {
-                            Ok(handle) => handle,
-                            Err(cause) => {
-                                error!("failed to open {}, poisoning: {cause}", self.id);
-                                BaoFileStorage::Poisoned
-                            }
-                        },
+                // we must assign a new state even in the error case, otherwise
+                // tasks waiting for loading would stall!
+                let state = match self.global.db.get(self.id).await {
+                    Ok(state) => match BaoFileStorage::open(state, self).await {
+                        Ok(handle) => handle,
                         Err(cause) => {
-                            error!("failed to get {} from db, poisoning: {cause}", self.id);
+                            error!("failed to open {}, poisoning: {cause}", self.id);
                             BaoFileStorage::Poisoned
                         }
+                    },
+                    Err(cause) => {
+                        error!("failed to get {} from db, poisoning: {cause}", self.id);
+                        BaoFileStorage::Poisoned
                     }
                 };
                 self.state.send_replace(state);
@@ -431,14 +420,7 @@ impl HashContext {
     }
 
     pub async fn get_entry_state(&self) -> io::Result<Option<EntryState<Bytes>>> {
-        let hash = self.id;
-        if hash == Hash::EMPTY {
-            return Ok(Some(EntryState::Complete {
-                data_location: DataLocation::Inline(Bytes::new()),
-                outboard_location: OutboardLocation::NotNeeded,
-            }));
-        };
-        self.db().get(hash).await
+        self.db().get(self.id).await
     }
 
     /// Update the entry state in the database, and wait for completion.
@@ -480,8 +462,9 @@ impl Actor {
     }
 
     async fn handle_command(&mut self, cmd: Command) {
-        let span = cmd.parent_span();
+        let span = cmd.span().clone();
         let _entered = span.enter();
+        debug_assert_eq!(cmd.validate(), Ok(()), "protocol violation in {cmd:?}");
         match cmd {
             Command::SyncDb(cmd) => {
                 trace!("{cmd:?}");
@@ -505,7 +488,17 @@ impl Actor {
             }
             Command::ListTags(cmd) => {
                 trace!("{cmd:?}");
-                self.db().send(cmd.into()).await.ok();
+                match self.db().snapshot(cmd.span.clone()).await {
+                    Ok(snapshot) => self.spawn(list_tags(snapshot, cmd)),
+                    Err(cause) => {
+                        self.spawn(async move {
+                            cmd.tx
+                                .send(proto::ListTagsItem::Error(api::Error::other(cause)))
+                                .await
+                                .ok();
+                        });
+                    }
+                }
             }
             Command::DeleteTags(cmd) => {
                 trace!("{cmd:?}");
@@ -529,8 +522,16 @@ impl Actor {
             }
             Command::ListBlobs(cmd) => {
                 trace!("{cmd:?}");
-                if let Ok(snapshot) = self.db().snapshot(cmd.span.clone()).await {
-                    self.spawn(list_blobs(snapshot, cmd));
+                match self.db().snapshot(cmd.span.clone()).await {
+                    Ok(snapshot) => self.spawn(list_blobs(snapshot, cmd)),
+                    Err(cause) => {
+                        self.spawn(async move {
+                            cmd.tx
+                                .send(proto::ListBlobsItem::Error(api::Error::other(cause)))
+                                .await
+                                .ok();
+                        });
+                    }
                 }
             }
             Command::Batch(cmd) => {
@@ -545,7 +546,14 @@ impl Actor {
             Command::ListTempTags(cmd) => {
                 trace!("{cmd:?}");
                 let tts = self.temp_tags.list();
-                cmd.tx.send(tts).await.ok();
+                self.spawn(async move {
+                    for tt in tts {
+                        if cmd.tx.send(proto::ListTempTagsItem::Tag(tt)).await.is_err() {
+                            return;
+                        }
+                    }
+                    cmd.tx.send(proto::ListTempTagsItem::Done).await.ok();
+                });
             }
             Command::ImportBytes(cmd) => {
                 trace!("{cmd:?}");
@@ -558,6 +566,9 @@ impl Actor {
             Command::ImportPath(cmd) => {
                 trace!("{cmd:?}");
                 self.spawn(import_path(cmd, self.context()));
+            }
+            Command::ExportPath(cmd) if cmd.hash == Hash::EMPTY => {
+                self.spawn(super::util::export_empty(cmd));
             }
             Command::ExportPath(cmd) => {
                 trace!("{cmd:?}");
@@ -596,36 +607,33 @@ impl Actor {
             }
             InternalCommand::FinishImport(cmd) => {
                 trace!("{cmd:?}");
+                let value = HashAndFormat {
+                    hash: cmd.hash,
+                    format: cmd.format,
+                };
                 if cmd.hash == Hash::EMPTY {
-                    cmd.tx
-                        .send(AddProgressItem::Done(TempTag::leaking_empty(cmd.format)))
-                        .await
-                        .ok();
-                } else {
-                    let tt = self.temp_tags.create(
-                        cmd.scope,
-                        HashAndFormat {
-                            hash: cmd.hash,
-                            format: cmd.format,
-                        },
-                    );
-                    let hash = cmd.hash;
-                    self.handles
-                        .spawn_wait(
-                            hash,
-                            move |arg| async move {
-                                match arg {
-                                    SpawnArg::Active(state) => (tt, cmd).handle(state).await,
-                                    SpawnArg::Dead => (tt, cmd).on_error(arg).await,
-                                    SpawnArg::Busy => {
-                                        unreachable!("waiting admission never returns Busy")
-                                    }
-                                }
-                            },
-                            &mut self.tasks,
-                        )
-                        .await;
+                    // the empty blob is always present, so there is nothing to store or protect
+                    let tt = TempTag::new(value, None);
+                    cmd.tx.send(AddProgressItem::Done(tt)).await.ok();
+                    return;
                 }
+                let tt = self.temp_tags.create(cmd.scope, value);
+                let hash = cmd.hash;
+                self.handles
+                    .spawn_wait(
+                        hash,
+                        move |arg| async move {
+                            match arg {
+                                SpawnArg::Active(state) => (tt, cmd).handle(state).await,
+                                SpawnArg::Dead => (tt, cmd).on_error(arg).await,
+                                SpawnArg::Busy => {
+                                    unreachable!("waiting admission never returns Busy")
+                                }
+                            }
+                        },
+                        &mut self.tasks,
+                    )
+                    .await;
             }
         }
     }
@@ -711,7 +719,13 @@ impl Actor {
         fs::create_dir_all(db_path.parent().unwrap())?;
         let (db_send, db_recv) = tokio::sync::mpsc::channel(100);
         let (protect, ds) = delete_set::pair(Arc::new(options.path.clone()));
-        let db_actor = meta::Actor::new(db_path, db_recv, ds, options.batch.clone())?;
+        let db_actor = meta::Actor::new(
+            db_path,
+            db_recv,
+            ds,
+            options.batch.clone(),
+            options.syncs_files(),
+        )?;
         // We hold the database lock now, so no other store is importing into the temp
         // directory. Anything in it is left over from imports that did not complete,
         // for example because the process was killed.
@@ -1075,7 +1089,7 @@ impl EntityApi for HashContext {
             };
             let path = self.global.options.path.bitfield_path(hash);
             trace!("writing bitfield for hash {} to {}", hash, path.display());
-            if let Err(cause) = fs.sync_all(&path) {
+            if let Err(cause) = fs.write_bitfield(&path, self.global.options.syncs_files()) {
                 error!(
                     "failed to write bitfield for {} at {}: {:?}",
                     hash,
@@ -1088,10 +1102,35 @@ impl EntityApi for HashContext {
     }
 }
 
+/// Syncs the contents of a file the store owns to disk.
+fn sync_file(path: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    let file = fs::File::open(path)?;
+    // windows only syncs handles with write access, and a copied
+    // read-only source keeps its read-only attribute
+    #[cfg(windows)]
+    let file = {
+        let mut perms = fs::metadata(path)?.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            fs::set_permissions(path, perms)?;
+        }
+        fs::OpenOptions::new().write(true).open(path)?
+    };
+    file.sync_data()
+}
+
+/// Syncs the directory at `path`, where the platform allows it.
+fn sync_dir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
 async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::Result<()> {
-    if ctx.id == Hash::EMPTY {
-        return Ok(()); // nothing to do for the empty hash
-    }
     let ImportEntry {
         source,
         hash,
@@ -1099,6 +1138,7 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
         ..
     } = import_data;
     let options = ctx.options();
+    let sync = options.syncs_files();
     match &source {
         ImportSource::Memory(data) => {
             debug_assert!(options.is_inlined_data(data.len() as u64));
@@ -1122,6 +1162,9 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
         ImportSource::Memory(data) => DataLocation::Inline(data),
         ImportSource::External(path, _file, size) => DataLocation::External(vec![path], size),
         ImportSource::TempFile(path, _file, size) => {
+            if sync {
+                sync_file(path.as_ref())?;
+            }
             // this will always work on any unix, but on windows there might be an issue if the target file is open!
             // possibly open with FILE_SHARE_DELETE on windows?
             let target = ctx.options().path.data_path(&hash);
@@ -1142,6 +1185,9 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
         MemOrFile::Mem(bytes) if bytes.is_empty() => OutboardLocation::NotNeeded,
         MemOrFile::Mem(bytes) => OutboardLocation::Inline(bytes),
         MemOrFile::File(path) => {
+            if sync {
+                sync_file(path.as_ref())?;
+            }
             // the same caveat as above applies here
             let target = ctx.options().path.outboard_path(&hash);
             trace!(
@@ -1157,6 +1203,12 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
             OutboardLocation::Owned
         }
     };
+    let moved = matches!(data_location, DataLocation::Owned(_))
+        || matches!(outboard_location, OutboardLocation::Owned);
+    if sync && moved {
+        // A rename survives a crash only once its directory is synced.
+        sync_dir(&options.path.data_path)?;
+    }
     let data = match &data_location {
         DataLocation::Inline(data) => MemOrFile::Mem(data.clone()),
         DataLocation::Owned(size) => {
@@ -1280,7 +1332,7 @@ async fn export_bao_impl(
     let ExportBaoRequest { ranges, hash, .. } = cmd;
     let outboard = ctx.outboard()?;
     let size = outboard.tree.size();
-    if size == 0 && cmd.hash != Hash::EMPTY {
+    if size == 0 {
         // we have no data whatsoever, so we stop here
         return Ok(());
     }
@@ -1375,12 +1427,13 @@ async fn export_path_impl(
                     external.truncate(MAX_EXTERNAL_PATHS);
                 } else {
                     // the file was previously owned, so we can just move it.
-                    // if that fails with ERR_CROSS, we fall back to copy.
+                    // if the target is on another file system or drive, we
+                    // fall back to copy: EXDEV on unix, ERROR_NOT_SAME_DEVICE
+                    // on windows.
                     match std::fs::rename(&source_path, &target) {
                         Ok(()) => {}
                         Err(cause) => {
-                            const ERR_CROSS: i32 = 18;
-                            if cause.raw_os_error() == Some(ERR_CROSS) {
+                            if cause.kind() == io::ErrorKind::CrossesDevices {
                                 reflink_or_copy_with_progress(&source_path, &target, size, tx)
                                     .await?;
                             } else {
@@ -1549,7 +1602,7 @@ pub struct FsStore {
 
 impl From<FsStore> for Store {
     fn from(value: FsStore) -> Self {
-        Store::from_sender(value.sender)
+        Store::from_client(value.sender)
     }
 }
 
@@ -2307,19 +2360,14 @@ pub mod tests {
     }
 
     fn native_import_entry(data: Bytes, tx: mpsc::Sender<AddProgressItem>) -> InternalCommand {
-        ImportEntryMsg {
-            inner: ImportEntry {
-                hash: Hash::new(&data),
-                format: crate::BlobFormat::Raw,
-                scope: Scope::GLOBAL,
-                source: ImportSource::Memory(data),
-                outboard: MemOrFile::empty(),
-            },
-            tx,
-            rx: irpc::channel::none::NoReceiver,
-            span: tracing::Span::none(),
-        }
-        .into()
+        let entry = ImportEntry {
+            hash: Hash::new(&data),
+            format: crate::BlobFormat::Raw,
+            scope: Scope::GLOBAL,
+            source: ImportSource::Memory(data),
+            outboard: MemOrFile::empty(),
+        };
+        InternalCommand::FinishImport((entry, tx).into())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2434,6 +2482,7 @@ pub mod tests {
                     .tags()
                     .list_temp_tags()
                     .await?
+                    .map(|item| item.unwrap())
                     .collect::<Vec<_>>()
                     .await;
                 if !tags.iter().any(|value| value.hash == hash) {
@@ -2493,6 +2542,7 @@ pub mod tests {
             .tags()
             .list_temp_tags()
             .await?
+            .map(|item| item.unwrap())
             .collect::<HashSet<_>>()
             .await;
         assert!(tts.contains(&tt1.hash_and_format()));
@@ -2504,6 +2554,7 @@ pub mod tests {
             .tags()
             .list_temp_tags()
             .await?
+            .map(|item| item.unwrap())
             .collect::<HashSet<_>>()
             .await;
         // temp tag went out of scope, so it does not work anymore
