@@ -307,7 +307,15 @@ pub async fn handle_connection(
                 .as_ref()
                 .map(|observer| (observer.clone(), connection.clone()));
             let transfer = handle_stream_scoped(pair, store, move |pair| {
-                observer.map(|(observer, conn)| observer.opened(&conn, &pair.writer))
+                let (observer, conn) = observer?;
+                let guard = observer.opened(&conn, &pair.writer)?;
+                let delivered = pair.writer.stopped();
+                Some(async move {
+                    // The writer can finish before the last data is acknowledged. Keep
+                    // its path policy alive through retransmission, FIN and peer stop.
+                    let _ = delivered.await;
+                    drop(guard);
+                })
             });
             n0_future::task::spawn(transfer.instrument(span));
         }
@@ -379,13 +387,13 @@ pub async fn handle_stream<R: RecvStream, W: SendStream>(
     pair: StreamPair<R, W>,
     store: Store,
 ) -> n0_error::Result<()> {
-    handle_stream_scoped(pair, store, |_| None).await
+    handle_stream_scoped(pair, store, |_| None::<std::future::Ready<()>>).await
 }
 
-async fn handle_stream_scoped<R: RecvStream, W: SendStream>(
+async fn handle_stream_scoped<R: RecvStream, W: SendStream, F: Future<Output = ()>>(
     pair: StreamPair<R, W>,
     store: Store,
-    scope: impl FnOnce(&StreamPair<R, W>) -> Option<Box<dyn Send>>,
+    scope: impl FnOnce(&StreamPair<R, W>) -> Option<F>,
 ) -> n0_error::Result<()> {
     let result = dispatch(pair, store, scope).await;
     if let Err(error) = &result {
@@ -395,19 +403,22 @@ async fn handle_stream_scoped<R: RecvStream, W: SendStream>(
     result
 }
 
-async fn dispatch<R: RecvStream, W: SendStream>(
+async fn dispatch<R: RecvStream, W: SendStream, F: Future<Output = ()>>(
     mut pair: StreamPair<R, W>,
     store: Store,
-    scope: impl FnOnce(&StreamPair<R, W>) -> Option<Box<dyn Send>>,
+    scope: impl FnOnce(&StreamPair<R, W>) -> Option<F>,
 ) -> n0_error::Result<()> {
     let request = pair.read_request().await?;
-    let _scope = scope(&pair);
+    let delivered = scope(&pair);
     match request {
         Request::Get(request) => handle_get(pair, store, request).await?,
         Request::GetMany(request) => handle_get_many(pair, store, request).await?,
         Request::Observe(request) => handle_observe(pair, store, request).await?,
         Request::Push(request) => handle_push(pair, store, request).await?,
-        _ => {}
+        _ => drop(pair),
+    }
+    if let Some(delivered) = delivered {
+        delivered.await;
     }
     Ok(())
 }
@@ -965,10 +976,10 @@ mod tests {
             }
         }
         impl NativeStreamObserver for Observer {
-            fn opened(&self, conn: &Connection, send: &SendStream) -> Box<dyn Send> {
+            fn opened(&self, conn: &Connection, send: &SendStream) -> Option<Box<dyn Send>> {
                 let key = (conn.stable_id() as u64, send.id().index());
                 self.0.send((key.0, key.1, true)).unwrap();
-                Box::new(Scope(key.0, key.1, self.0.clone()))
+                Some(Box::new(Scope(key.0, key.1, self.0.clone())))
             }
         }
 

@@ -280,10 +280,11 @@ impl<T> Deref for Notify<T> {
 /// The provider still consults its configured admission events before sending data.
 /// No connection or stream handle is serialized in provider events.
 pub trait NativeStreamObserver: Debug + Send + Sync + 'static {
-    /// The scope is dropped on completion, cancellation, or refusal. Implementations can
+    /// The scope is held through acknowledgement or peer stop after a successful response,
+    /// and dropped immediately on cancellation or refusal. Implementations can
     /// correlate the stream with request events by connection stable ID and stream index.
-    /// If path monitoring is needed after FIN, continue until `SendStream::stopped`.
-    fn opened(&self, connection: &Connection, writer: &SendStream) -> Box<dyn Send>;
+    /// Return `None` when this stream needs no local policy.
+    fn opened(&self, connection: &Connection, writer: &SendStream) -> Option<Box<dyn Send>>;
 }
 
 #[derive(Debug, Default, Clone)]
