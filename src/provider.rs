@@ -302,7 +302,14 @@ pub async fn handle_connection(
         while let Ok(pair) = StreamPair::accept(&connection, progress.clone()).await {
             let span = debug_span!("stream", stream_id = %pair.stream_id());
             let store = store.clone();
-            n0_future::task::spawn(handle_stream(pair, store).instrument(span));
+            let observer = progress
+                .native_stream_observer
+                .as_ref()
+                .map(|observer| (observer.clone(), connection.clone()));
+            let transfer = handle_stream_scoped(pair, store, move |pair| {
+                observer.map(|(observer, conn)| observer.opened(&conn, &pair.writer))
+            });
+            n0_future::task::spawn(transfer.instrument(span));
         }
         progress
             .connection_closed(|| ConnectionClosed { connection_id })
@@ -372,7 +379,15 @@ pub async fn handle_stream<R: RecvStream, W: SendStream>(
     pair: StreamPair<R, W>,
     store: Store,
 ) -> n0_error::Result<()> {
-    let result = dispatch(pair, store).await;
+    handle_stream_scoped(pair, store, |_| None).await
+}
+
+async fn handle_stream_scoped<R: RecvStream, W: SendStream>(
+    pair: StreamPair<R, W>,
+    store: Store,
+    scope: impl FnOnce(&StreamPair<R, W>) -> Option<Box<dyn Send>>,
+) -> n0_error::Result<()> {
+    let result = dispatch(pair, store, scope).await;
     if let Err(error) = &result {
         // The peer only sees a reset with an error code, so keep the cause.
         debug!("stream failed: {error:#}");
@@ -383,8 +398,10 @@ pub async fn handle_stream<R: RecvStream, W: SendStream>(
 async fn dispatch<R: RecvStream, W: SendStream>(
     mut pair: StreamPair<R, W>,
     store: Store,
+    scope: impl FnOnce(&StreamPair<R, W>) -> Option<Box<dyn Send>>,
 ) -> n0_error::Result<()> {
     let request = pair.read_request().await?;
+    let _scope = scope(&pair);
     match request {
         Request::Get(request) => handle_get(pair, store, request).await?,
         Request::GetMany(request) => handle_get_many(pair, store, request).await?,
@@ -924,6 +941,87 @@ mod tests {
             let error = ExportBaoError::from(rejection);
             assert!(!is_local_export_failure(&error), "{error:#}");
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_request_scope_spans_the_admission_decision_and_transfer() -> TestResult<()> {
+        use std::{sync::Arc, time::Duration};
+
+        use iroh::{
+            endpoint::{Connection, SendStream},
+            protocol::Router,
+        };
+        use tokio::sync::mpsc;
+
+        use super::events::{AbortReason, NativeStreamObserver, ProviderMessage, RequestMode};
+
+        #[derive(Debug)]
+        struct Observer(mpsc::UnboundedSender<(u64, u64, bool)>);
+        struct Scope(u64, u64, mpsc::UnboundedSender<(u64, u64, bool)>);
+        impl Drop for Scope {
+            fn drop(&mut self) {
+                let _ = self.2.send((self.0, self.1, false));
+            }
+        }
+        impl NativeStreamObserver for Observer {
+            fn opened(&self, conn: &Connection, send: &SendStream) -> Box<dyn Send> {
+                let key = (conn.stable_id() as u64, send.id().index());
+                self.0.send((key.0, key.1, true)).unwrap();
+                Box::new(Scope(key.0, key.1, self.0.clone()))
+            }
+        }
+
+        let store = MemStore::new();
+        let payload = b"scoped response";
+        let tag = store.add_slice(payload).await?;
+        let (status, mut statuses) = mpsc::unbounded_channel();
+        let (events, mut admissions) = EventSender::channel(
+            4,
+            EventMask {
+                get: RequestMode::Intercept,
+                ..EventMask::DEFAULT
+            },
+        );
+        let events = events.with_native_stream_observer(Arc::new(Observer(status)));
+        let router = Router::builder(test_endpoint().await?)
+            .accept(ALPN, crate::BlobsProtocol::new(&store, Some(events)))
+            .spawn();
+        let client = test_endpoint().await?;
+        let conn = client.connect(router.endpoint().addr(), ALPN).await?;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for allowed in [false, true] {
+                let read = tokio::spawn({
+                    let conn = conn.clone();
+                    let hash = tag.hash;
+                    async move { get::request::get_blob(conn, hash).await }
+                });
+                let Some(ProviderMessage::GetRequestReceived(msg)) = admissions.recv().await else {
+                    panic!("expected native get admission");
+                };
+                let (conn_id, stream_id) = (msg.inner.connection_id, msg.inner.request_id);
+                assert_eq!(statuses.try_recv().unwrap(), (conn_id, stream_id, true));
+                assert!(statuses.try_recv().is_err());
+                msg.tx
+                    .send(if allowed {
+                        Ok(())
+                    } else {
+                        Err(AbortReason::Permission)
+                    })
+                    .await
+                    .unwrap();
+                let received = read.await.unwrap();
+                if allowed {
+                    assert_eq!(received.unwrap().as_ref(), payload);
+                } else {
+                    assert!(received.is_err());
+                }
+                assert_eq!(statuses.recv().await.unwrap(), (conn_id, stream_id, false));
+            }
+        })
+        .await?;
+        router.shutdown().await?;
+        client.close().await;
         Ok(())
     }
 

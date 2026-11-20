@@ -1,6 +1,6 @@
-use std::{fmt::Debug, io, ops::Deref};
+use std::{fmt::Debug, io, ops::Deref, sync::Arc};
 
-use iroh::endpoint::VarInt;
+use iroh::endpoint::{Connection, SendStream, VarInt};
 use irpc::{
     channel::{mpsc, none::NoSender, oneshot},
     rpc_requests, Channels, WithChannels,
@@ -275,10 +275,22 @@ impl<T> Deref for Notify<T> {
     }
 }
 
+/// Supplies a local scope for a parsed request on the native provider. This lets an
+/// in-process request interceptor apply transport policy to the actual response stream.
+/// The provider still consults its configured admission events before sending data.
+/// No connection or stream handle is serialized in provider events.
+pub trait NativeStreamObserver: Debug + Send + Sync + 'static {
+    /// The scope is dropped on completion, cancellation, or refusal. Implementations can
+    /// correlate the stream with request events by connection stable ID and stream index.
+    /// If path monitoring is needed after FIN, continue until `SendStream::stopped`.
+    fn opened(&self, connection: &Connection, writer: &SendStream) -> Box<dyn Send>;
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct EventSender {
     mask: EventMask,
     inner: Option<irpc::Client<ProviderProto>>,
+    pub(super) native_stream_observer: Option<Arc<dyn NativeStreamObserver>>,
 }
 
 #[derive(Debug, Default)]
@@ -375,13 +387,22 @@ impl EventSender {
     pub const DEFAULT: Self = Self {
         mask: EventMask::DEFAULT,
         inner: None,
+        native_stream_observer: None,
     };
 
     pub fn new(client: tokio::sync::mpsc::Sender<ProviderMessage>, mask: EventMask) -> Self {
         Self {
             mask,
             inner: Some(irpc::Client::from(client)),
+            native_stream_observer: None,
         }
+    }
+
+    /// Observe native response streams in this process. Existing event masks and RPC
+    /// decisions continue to apply. Generic in-memory stream handlers have no QUIC path.
+    pub fn with_native_stream_observer(mut self, observer: Arc<dyn NativeStreamObserver>) -> Self {
+        self.native_stream_observer = Some(observer);
+        self
     }
 
     pub fn channel(
@@ -482,10 +503,7 @@ impl EventSender {
                 }
             }
         });
-        Self {
-            mask,
-            inner: Some(irpc::Client::from(tx)),
-        }
+        Self::new(tx, mask)
     }
 
     /// A new client has been connected.
@@ -835,7 +853,10 @@ mod tests {
 
     #[tokio::test]
     async fn decisions_fail_closed_without_a_handler() {
-        let without = |mask| EventSender { mask, inner: None };
+        let without = |mask| EventSender {
+            mask,
+            ..EventSender::DEFAULT
+        };
         for mode in [RequestMode::Intercept, RequestMode::InterceptLog] {
             let error = without(get_mask(mode)).request(get, 0, 0).await;
             assert!(matches!(error, Err(ProgressError::Permission { .. })));

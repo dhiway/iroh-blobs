@@ -1164,13 +1164,8 @@ mod tests {
         }
 
         fn futures_poll_ready<F: Future>(future: std::pin::Pin<&mut F>) -> bool {
-            struct Wake;
-            impl std::task::Wake for Wake {
-                fn wake(self: Arc<Self>) {}
-            }
-            let waker = std::task::Waker::from(Arc::new(Wake));
             future
-                .poll(&mut std::task::Context::from_waker(&waker))
+                .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
                 .is_ready()
         }
     }
