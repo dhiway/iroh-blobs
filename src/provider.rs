@@ -409,16 +409,41 @@ async fn dispatch<R: RecvStream, W: SendStream, F: Future<Output = ()>>(
     scope: impl FnOnce(&StreamPair<R, W>) -> Option<F>,
 ) -> n0_error::Result<()> {
     let request = pair.read_request().await?;
-    let delivered = scope(&pair);
-    match request {
-        Request::Get(request) => handle_get(pair, store, request).await?,
-        Request::GetMany(request) => handle_get_many(pair, store, request).await?,
-        Request::Observe(request) => handle_observe(pair, store, request).await?,
-        Request::Push(request) => handle_push(pair, store, request).await?,
-        _ => drop(pair),
+    // Push consumes the peer's bytes; it has no outgoing blob payload to route.
+    let delivered = match &request {
+        Request::Get(_) | Request::GetMany(_) | Request::Observe(_) => scope(&pair),
+        _ => None,
+    };
+    let transfer = async move {
+        match request {
+            Request::Get(request) => handle_get(pair, store, request).await?,
+            Request::GetMany(request) => handle_get_many(pair, store, request).await?,
+            Request::Observe(request) => handle_observe(pair, store, request).await?,
+            Request::Push(request) => handle_push(pair, store, request).await?,
+            _ => drop(pair),
+        }
+        Ok(())
+    };
+    match delivered {
+        Some(delivered) => transfer_until_stopped(transfer, delivered).await,
+        None => transfer.await,
     }
-    if let Some(delivered) = delivered {
-        delivered.await;
+}
+
+async fn transfer_until_stopped(
+    transfer: impl Future<Output = n0_error::Result<()>>,
+    delivered: impl Future<Output = ()>,
+) -> n0_error::Result<()> {
+    tokio::pin!(delivered);
+    tokio::select! {
+        biased;
+        result = transfer => {
+            result?;
+            delivered.await;
+        }
+        // Also release the request and its admission receiver when the peer leaves
+        // before the interceptor replies. The default provider path does no extra work.
+        _ = &mut delivered => {}
     }
     Ok(())
 }
@@ -1031,9 +1056,48 @@ mod tests {
             }
         })
         .await?;
+        // Keep the admission response alive while the peer disconnects. The request
+        // scope must disappear without the interceptor replying or dropping its sender.
+        let waiting = tokio::spawn({
+            let conn = conn.clone();
+            let hash = tag.hash;
+            async move { get::request::get_blob(conn, hash).await }
+        });
+        let Some(ProviderMessage::GetRequestReceived(pending)) =
+            tokio::time::timeout(Duration::from_secs(10), admissions.recv()).await?
+        else {
+            panic!("expected pending get admission");
+        };
+        let key = (pending.inner.connection_id, pending.inner.request_id);
+        assert_eq!(statuses.try_recv().unwrap(), (key.0, key.1, true));
+        conn.close(0u32.into(), b"done");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), statuses.recv()).await?,
+            Some((key.0, key.1, false))
+        );
+        drop(pending);
+        assert!(waiting.await?.is_err());
         router.shutdown().await?;
         client.close().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn successful_scoped_transfer_waits_for_transport_acknowledgement() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let (ack, delivered) = tokio::sync::oneshot::channel::<()>();
+        let transfer =
+            super::transfer_until_stopped(async { Ok(()) }, async { delivered.await.unwrap() });
+        tokio::pin!(transfer);
+        assert!(matches!(
+            transfer
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop())),
+            Poll::Pending
+        ));
+        ack.send(()).unwrap();
+        transfer.await.unwrap();
     }
 
     /// Serves a single get request for `hash`, where the client drops the
